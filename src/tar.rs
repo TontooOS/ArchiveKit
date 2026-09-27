@@ -311,12 +311,23 @@ impl<'a> TarReader<'a> {
                 return Err(invalid("tar header checksum mismatch"));
             }
             let size = parse_octal(h.size)?;
-            let data_blocks = size.div_ceil(512) as usize;
-            if self.pos + data_blocks * BLOCK > self.data.len() {
-                return Err(invalid("truncated tar entry data"));
-            }
-            let payload = &self.data[self.pos..self.pos + size as usize];
-            self.pos += data_blocks * BLOCK;
+            // Checked arithmetic throughout: sizes are untrusted (base-256
+            // can encode up to u64::MAX).
+            let len = self.data.len() as u64;
+            let data_end = (self.pos as u64)
+                .checked_add(size)
+                .filter(|&e| e <= len)
+                .ok_or_else(|| invalid("truncated tar entry data"))?;
+            let padded = size
+                .div_ceil(512)
+                .checked_mul(512)
+                .ok_or_else(|| invalid("tar entry size overflow"))?;
+            let next_pos = (self.pos as u64)
+                .checked_add(padded)
+                .filter(|&e| e <= len)
+                .ok_or_else(|| invalid("truncated tar entry data"))?;
+            let payload = &self.data[self.pos..data_end as usize];
+            self.pos = next_pos as usize;
 
             match h.typeflag {
                 b'L' => {

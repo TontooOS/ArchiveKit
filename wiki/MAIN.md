@@ -55,5 +55,6 @@ See [Combined.md](Combined.md), [App.md](App.md), [Zip.md](Zip.md), [Gzip.md](Gz
 
 ## Changelog
 
+- 2026-09-27: GZIP single-pass decode, ZIP capacity hints, fuzz harness (120k cases clean) + overflow hardening
 - 2026-09-27: Added `.app` containers (TAPP) with FishFile manifest, tico icons and random access
 - 2026-09-27: Initial wiki for ArchiveKit 26.1.0

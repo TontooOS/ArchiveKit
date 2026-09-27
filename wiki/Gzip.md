@@ -76,7 +76,7 @@ Decompresses all members and returns the concatenated payloads. Returns `Err` on
 pub fn gzip_decompress_limited(data: &[u8], max_output: usize) -> Result<Vec<u8>>
 ```
 
-Same as `gzip_decompress` with an explicit total output cap.
+Same as `gzip_decompress` with an explicit total output cap. Single-pass: members inflate straight into the output buffer while the CRC is folded in (no per-member buffers, no concat copy).
 
 ### `gzip_members` / `gzip_members_limited`
 

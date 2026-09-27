@@ -513,8 +513,19 @@ pub(crate) fn decompress_raw_with_consumed(
     data: &[u8],
     max_output: usize,
 ) -> Result<(Vec<u8>, usize)> {
+    let mut out = Vec::new();
+    let n = decompress_raw_into(data, &mut out, max_output)?;
+    Ok((out, n))
+}
+
+/// Decompress, appending to `out` (caller may pre-reserve an exact size).
+/// Returns input bytes consumed.
+pub(crate) fn decompress_raw_into(
+    data: &[u8],
+    out: &mut Vec<u8>,
+    max_output: usize,
+) -> Result<usize> {
     let mut r = BitReader::new(data);
-    let mut out: Vec<u8> = Vec::new();
     let mut final_block = false;
 
     while !final_block {
@@ -536,16 +547,16 @@ pub(crate) fn decompress_raw_with_consumed(
                 out.extend_from_slice(r.read_bytes(len as usize)?);
             }
             1 => {
-                decode_huffman_block(&mut r, &mut out, fixed_lit_table(), fixed_dist_table(), max_output)?;
+                decode_huffman_block(&mut r, &mut *out, fixed_lit_table(), fixed_dist_table(), max_output)?;
             }
             2 => {
                 let (lit, dist) = read_dynamic_tables(&mut r)?;
-                decode_huffman_block(&mut r, &mut out, &lit, &dist, max_output)?;
+                decode_huffman_block(&mut r, &mut *out, &lit, &dist, max_output)?;
             }
             _ => return Err(invalid("reserved deflate block type")),
         }
     }
-    Ok((out, r.consumed() as usize))
+    Ok(r.consumed() as usize)
 }
 
 // ---------------------------------------------------------------------------

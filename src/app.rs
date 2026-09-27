@@ -154,7 +154,9 @@ impl AppManifest {
 
     /// Parse `.fico` text via FishFile.
     pub fn from_fico(text: &str) -> Result<Self> {
-        let doc = fishfile::FishDocument::parse(text)
+        // FishFile is an external crate: never let it panic across our API.
+        let doc = std::panic::catch_unwind(|| fishfile::FishDocument::parse(text))
+            .map_err(|_| invalid("app manifest crashed the fico parser"))?
             .map_err(|e| invalid(format!("app manifest: {e}")))?;
         let req = |key: &str| {
             doc.get(key)
@@ -802,7 +804,10 @@ impl<R: Read + Seek> AppReader<R> {
         let central_len = u64::from_le_bytes(footer[12..20].try_into().unwrap());
         let count = u32::from_le_bytes(footer[20..24].try_into().unwrap()) as usize;
         let central_crc = u32::from_le_bytes(footer[24..28].try_into().unwrap());
-        if central_offset + central_len > file_len {
+        let central_end = central_offset
+            .checked_add(central_len)
+            .ok_or_else(|| invalid("app central directory out of bounds"))?;
+        if central_end > file_len {
             return Err(invalid("app central directory out of bounds"));
         }
         let mut central = vec![0u8; central_len as usize];
@@ -876,9 +881,14 @@ impl<R: Read + Seek> AppReader<R> {
         if meta.raw_len > DEFAULT_MAX_OUTPUT as u64 {
             return Err(invalid("app entry exceeds output limit"));
         }
+        // Bound the upcoming allocation against the actual stream size.
+        let stream_end = self.inner.seek(SeekFrom::End(0)).map_err(ArchiveError::from)?;
         self.inner
             .seek(SeekFrom::Start(meta.offset))
             .map_err(ArchiveError::from)?;
+        if meta.offset > stream_end || meta.comp_len > stream_end - meta.offset {
+            return Err(invalid("app entry out of bounds"));
+        }
         let header = read_record_header(&mut self.inner)?;
         if header.name != meta.name
             || header.method != meta.method

@@ -7,6 +7,7 @@
 use crate::crc::Crc32;
 use crate::deflate::{compress_raw, CompressionLevel, DEFAULT_MAX_OUTPUT};
 use crate::error::{invalid, Result};
+use std::io::Write;
 
 const MAGIC_0: u8 = 0x1F;
 const MAGIC_1: u8 = 0x8B;
@@ -92,10 +93,15 @@ pub fn gzip_decompress(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Decompress with an explicit total output limit (zip-bomb protection).
+///
+/// Single-pass: each member inflates straight into the output buffer while
+/// the CRC is folded in (no per-member buffers, no concat copy).
 pub fn gzip_decompress_limited(data: &[u8], max_output: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    for member in gzip_members_limited(data, max_output.saturating_sub(out.len()))? {
-        out.extend_from_slice(&member.data);
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let remaining = max_output.saturating_sub(out.len());
+        pos = decode_member_append(data, pos, &mut out, remaining)?;
     }
     if out.is_empty() && data.is_empty() {
         return Err(invalid("empty gzip stream"));
@@ -137,8 +143,16 @@ fn read_c_string(data: &[u8], mut pos: usize) -> Result<(String, usize)> {
     Ok((s, pos + 1))
 }
 
-fn decode_member(data: &[u8], pos: usize, max_output: usize) -> Result<(GzipMember, usize)> {
-    if data.len() - pos < 10 {
+/// Parsed member header plus the body offset.
+struct MemberHeader {
+    mtime: u32,
+    name: Option<String>,
+    os: u8,
+    body: usize,
+}
+
+fn parse_member_header(data: &[u8], pos: usize) -> Result<MemberHeader> {
+    if data.len().saturating_sub(pos) < 10 {
         return Err(invalid("truncated gzip header"));
     }
     if data[pos] != MAGIC_0 || data[pos + 1] != MAGIC_1 {
@@ -187,6 +201,17 @@ fn decode_member(data: &[u8], pos: usize, max_output: usize) -> Result<(GzipMemb
         p += 2;
     }
     let _ = FTEXT;
+    Ok(MemberHeader {
+        mtime,
+        name,
+        os,
+        body: p,
+    })
+}
+
+fn decode_member(data: &[u8], pos: usize, max_output: usize) -> Result<(GzipMember, usize)> {
+    let header = parse_member_header(data, pos)?;
+    let mut p = header.body;
 
     // The deflate stream ends where the 8-byte trailer (CRC32 + ISIZE)
     // begins. Our inflate reports consumed bytes, so member scanning is
@@ -206,7 +231,7 @@ fn decode_member(data: &[u8], pos: usize, max_output: usize) -> Result<(GzipMemb
         return Err(crate::error::ArchiveError::ChecksumMismatch {
             expected: expected_crc,
             actual: crc.finalize(),
-            entry: name.clone().unwrap_or_else(|| "<gzip member>".to_string()),
+            entry: header.name.clone().unwrap_or_else(|| "<gzip member>".to_string()),
         });
     }
     if payload.len() as u32 != expected_size {
@@ -214,13 +239,74 @@ fn decode_member(data: &[u8], pos: usize, max_output: usize) -> Result<(GzipMemb
     }
     Ok((
         GzipMember {
-            mtime,
-            name,
-            os,
+            mtime: header.mtime,
+            name: header.name,
+            os: header.os,
             data: payload,
         },
         p,
     ))
+}
+
+/// Write adapter folding CRC32 over everything appended.
+struct CrcAppend<'a> {
+    out: &'a mut Vec<u8>,
+    crc: Crc32,
+    written: u64,
+}
+
+impl Write for CrcAppend<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.out.extend_from_slice(buf);
+        self.crc.update(buf);
+        self.written += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Decode one member, appending its payload to `out` in a single pass.
+/// Returns the next member offset.
+fn decode_member_append(
+    data: &[u8],
+    pos: usize,
+    out: &mut Vec<u8>,
+    remaining: usize,
+) -> Result<usize> {
+    let header = parse_member_header(data, pos)?;
+    let mut p = header.body;
+    let mut sink = CrcAppend {
+        out,
+        crc: Crc32::new(),
+        written: 0,
+    };
+    let (written, read) = crate::deflate::decompress_stream(
+        &data[p..],
+        &mut sink,
+        remaining as u64,
+    )?;
+    debug_assert_eq!(written, sink.written);
+    p += read as usize;
+    if p + 8 > data.len() {
+        return Err(invalid("truncated gzip trailer"));
+    }
+    let expected_crc = u32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]);
+    let expected_size = u32::from_le_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]);
+    p += 8;
+    if sink.crc.finalize() != expected_crc {
+        return Err(crate::error::ArchiveError::ChecksumMismatch {
+            expected: expected_crc,
+            actual: sink.crc.finalize(),
+            entry: header.name.unwrap_or_else(|| "<gzip member>".to_string()),
+        });
+    }
+    if written != expected_size as u64 {
+        return Err(invalid("gzip size mismatch"));
+    }
+    Ok(p)
 }
 
 /// Buffered streaming encoder: collects input, emits the member on [`GzipEncoder::finish`].

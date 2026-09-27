@@ -585,7 +585,8 @@ impl<'a> ZipReader<'a> {
         unix_mode: Option<u32>,
     ) -> Result<ZipEntry> {
         let off = local_offset as usize;
-        if off + 30 > self.data.len() {
+        // Checked: `off` is untrusted u64 and may exceed the address space.
+        if off.checked_add(30).is_none_or(|e| e > self.data.len()) {
             return Err(invalid("bad zip local header offset"));
         }
         if u32le(self.data, off)? != SIG_LOCAL {
@@ -649,10 +650,18 @@ impl<'a> ZipReader<'a> {
                 raw.to_vec()
             }
             ZipMethod::Deflate => {
-                decompress_raw_limited(raw, self.max_output).map_err(|e| match e {
-                    ArchiveError::InvalidData(m) => invalid(format!("zip deflate error: {m}")),
-                    other => other,
-                })?
+                // Pre-reserve the exact size: no geometric regrowth copies.
+                let mut data = Vec::new();
+                data.reserve(uncomp_size as usize);
+                crate::deflate::decompress_raw_into(raw, &mut data, self.max_output).map_err(
+                    |e| match e {
+                        ArchiveError::InvalidData(m) => {
+                            invalid(format!("zip deflate error: {m}"))
+                        }
+                        other => other,
+                    },
+                )?;
+                data
             }
         };
         if data.len() as u64 != uncomp_size {
@@ -715,7 +724,10 @@ fn locate_central_dir(data: &[u8]) -> Result<(usize, u64, usize)> {
             cd_offset = u64le(data, eocd64_off + 48)?;
         }
     }
-    if cd_offset + cd_size > data.len() as u64 {
+    if cd_offset
+        .checked_add(cd_size)
+        .is_none_or(|end| end > data.len() as u64)
+    {
         return Err(invalid("zip central directory out of bounds"));
     }
     Ok((cd_offset as usize, cd_size, count))
@@ -985,7 +997,7 @@ impl ZipFileReader {
                 cd_offset = u64::from_le_bytes(rec[48..56].try_into().unwrap());
             }
         }
-        if cd_offset + cd_size > len {
+        if cd_offset.checked_add(cd_size).is_none_or(|end| end > len) {
             return Err(invalid("zip central directory out of bounds"));
         }
         file.seek(SeekFrom::Start(cd_offset))
