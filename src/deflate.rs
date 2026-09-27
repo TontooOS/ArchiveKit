@@ -39,94 +39,153 @@ impl CompressionLevel {
 
 struct BitReader<'a> {
     data: &'a [u8],
-    byte: usize,
-    bit: u8,
+    /// Next unread input byte.
+    pos: usize,
+    /// Buffered bits, consumed from the LSB.
+    bitbuf: u64,
+    /// Valid bits in `bitbuf`.
+    bits: u8,
 }
 
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8]) -> Self {
         Self {
             data,
-            byte: 0,
-            bit: 0,
+            pos: 0,
+            bitbuf: 0,
+            bits: 0,
         }
     }
 
+    /// Ensure at least `n` buffered bits (`n <= 16` everywhere below).
+    #[inline]
+    fn ensure(&mut self, n: u8) -> Result<()> {
+        while self.bits < n {
+            if self.pos >= self.data.len() {
+                return Err(invalid("unexpected end of deflate stream"));
+            }
+            self.bitbuf |= (self.data[self.pos] as u64) << self.bits;
+            self.bits += 8;
+            self.pos += 1;
+        }
+        Ok(())
+    }
+
+    #[inline]
     fn read_bit(&mut self) -> Result<u32> {
-        if self.byte >= self.data.len() {
-            return Err(invalid("unexpected end of deflate stream"));
-        }
-        let b = (self.data[self.byte] >> self.bit) & 1;
-        self.bit += 1;
-        if self.bit == 8 {
-            self.bit = 0;
-            self.byte += 1;
-        }
-        Ok(b as u32)
+        self.ensure(1)?;
+        let b = (self.bitbuf & 1) as u32;
+        self.bitbuf >>= 1;
+        self.bits -= 1;
+        Ok(b)
     }
 
     /// Read `n` bits as a little-endian integer (first bit = LSB).
+    #[inline]
     fn read_bits_le(&mut self, n: u8) -> Result<u32> {
-        let mut v = 0u32;
-        for i in 0..n {
-            v |= self.read_bit()? << i;
-        }
+        self.ensure(n)?;
+        let v = (self.bitbuf & ((1u64 << n) - 1)) as u32;
+        self.bitbuf >>= n;
+        self.bits -= n;
         Ok(v)
     }
 
-    /// Read a Huffman code accumulated MSB-first.
-    fn read_code(&mut self, tree: &DecodeTree) -> Result<u16> {
+    /// Peek up to 9 bits without failing (zero-padded past input end).
+    #[inline]
+    fn peek9(&mut self) -> u32 {
+        while self.bits < TABLE_BITS && self.pos < self.data.len() {
+            self.bitbuf |= (self.data[self.pos] as u64) << self.bits;
+            self.bits += 8;
+            self.pos += 1;
+        }
+        (self.bitbuf & 0x1FF) as u32
+    }
+
+    #[inline]
+    fn consume(&mut self, n: u8) {
+        debug_assert!(n <= self.bits);
+        self.bitbuf >>= n;
+        self.bits -= n;
+    }
+
+    /// Read a Huffman symbol via the fast table, slow tree on miss.
+    #[inline]
+    fn read_code(&mut self, table: &DecodeTable) -> Result<u16> {
+        let peek = self.peek9();
+        let (sym, len) = table.fast[peek as usize];
+        if sym != TABLE_LONG {
+            if len > self.bits {
+                return Err(invalid("unexpected end of deflate stream"));
+            }
+            self.consume(len);
+            return Ok(sym);
+        }
+        self.read_code_slow(&table.tree, peek)
+    }
+
+    /// Tree walk for codes longer than 9 bits (or invalid prefixes).
+    fn read_code_slow(&mut self, tree: &DecodeTree, peek: u32) -> Result<u16> {
+        // The peeked bits are the next stream bits in order; walk the tree
+        // with them first, then keep reading from the stream.
         let mut node = 0usize;
-        for _ in 0..15 {
+        for k in 0..TABLE_BITS {
+            if k >= self.bits {
+                return Err(invalid("unexpected end of deflate stream"));
+            }
+            let b = ((peek >> k) & 1) as usize;
+            node = tree.next(node, b)?;
+            if let Some(sym) = tree.symbol(node) {
+                self.consume(k + 1);
+                return Ok(sym);
+            }
+        }
+        loop {
             let b = self.read_bit()? as usize;
             node = tree.next(node, b)?;
             if let Some(sym) = tree.symbol(node) {
                 return Ok(sym);
             }
         }
-        Err(invalid("invalid huffman code"))
     }
 
     fn align_to_byte(&mut self) {
-        if self.bit != 0 {
-            self.bit = 0;
-            self.byte += 1;
-        }
+        let drop = self.bits & 7;
+        self.bitbuf >>= drop;
+        self.bits -= drop;
     }
 
     fn read_u16le(&mut self) -> Result<u16> {
-        self.align_to_byte();
-        if self.byte + 2 > self.data.len() {
-            return Err(invalid("unexpected end of deflate stream"));
-        }
-        let v = u16::from_le_bytes([self.data[self.byte], self.data[self.byte + 1]]);
-        self.byte += 2;
-        Ok(v)
+        let b = self.read_bytes(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
     }
 
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
         self.align_to_byte();
-        if self.byte + n > self.data.len() {
+        // Buffered whole bytes are the input bytes right before `pos`.
+        let buffered = (self.bits / 8) as usize;
+        let start = self.pos - buffered;
+        self.bitbuf = 0;
+        self.bits = 0;
+        if start + n > self.data.len() {
             return Err(invalid("unexpected end of deflate stream"));
         }
-        let s = &self.data[self.byte..self.byte + n];
-        self.byte += n;
-        Ok(s)
+        self.pos = start + n;
+        Ok(&self.data[start..start + n])
     }
 
     fn is_eof(&self) -> bool {
-        self.byte >= self.data.len()
+        (self.pos as u64) * 8 - self.bits as u64 >= (self.data.len() as u64) * 8
     }
 
-    /// Bytes consumed so far, including a partially-read byte.
+    /// Input bytes consumed so far, including a partially-read byte.
     fn consumed(&self) -> usize {
-        self.byte + if self.bit == 0 { 0 } else { 1 }
+        (((self.pos as u64) * 8 - self.bits as u64) + 7) as usize / 8
     }
 }
 
 struct BitWriter {
     out: Vec<u8>,
-    acc: u32,
+    acc: u64,
     nbits: u8,
 }
 
@@ -139,20 +198,26 @@ impl BitWriter {
         }
     }
 
+    #[inline]
     fn write_bit(&mut self, bit: u32) {
-        self.acc |= (bit & 1) << self.nbits;
+        self.acc |= (bit as u64 & 1) << self.nbits;
         self.nbits += 1;
-        if self.nbits == 8 {
+        if self.nbits >= 8 {
             self.out.push(self.acc as u8);
-            self.acc = 0;
-            self.nbits = 0;
+            self.acc >>= 8;
+            self.nbits -= 8;
         }
     }
 
     /// Write the low `n` bits of `value`, LSB first.
+    #[inline]
     fn write_bits_le(&mut self, value: u32, n: u8) {
-        for i in 0..n {
-            self.write_bit((value >> i) & 1);
+        self.acc |= (value as u64) << self.nbits;
+        self.nbits += n;
+        while self.nbits >= 8 {
+            self.out.push(self.acc as u8);
+            self.acc >>= 8;
+            self.nbits -= 8;
         }
     }
 
@@ -161,6 +226,12 @@ impl BitWriter {
         for i in (0..len).rev() {
             self.write_bit((code >> i) & 1);
         }
+    }
+
+    /// Write a pre-reversed Huffman code, LSB first.
+    #[inline]
+    fn write_code_rev(&mut self, rev: u32, len: u8) {
+        self.write_bits_le(rev, len);
     }
 
     fn align_to_byte(&mut self) {
@@ -259,6 +330,64 @@ impl DecodeTree {
     fn symbol(&self, node: usize) -> Option<u16> {
         self.symbol[node]
     }
+}
+
+use std::sync::OnceLock;
+
+/// Fast-table width: codes up to 9 bits resolve with one lookup.
+const TABLE_BITS: u8 = 9;
+/// Marker for prefixes longer than the fast table (or invalid).
+const TABLE_LONG: u16 = u16::MAX;
+
+/// Huffman decoder: 9-bit fast table plus the full tree for long codes.
+struct DecodeTable {
+    /// Indexed by the next 9 stream bits (LSB-first peek).
+    fast: [(u16, u8); 512],
+    tree: DecodeTree,
+}
+
+fn reverse_bits(mut code: u32, len: u8) -> u32 {
+    let mut rev = 0u32;
+    for _ in 0..len {
+        rev = (rev << 1) | (code & 1);
+        code >>= 1;
+    }
+    rev
+}
+
+fn build_table(lengths: &[u8]) -> Result<DecodeTable> {
+    let codes = canonical_codes(lengths);
+    let mut fast = [(TABLE_LONG, 0u8); 512];
+    for (sym, &(code, len)) in codes.iter().enumerate() {
+        if len == 0 || len > TABLE_BITS {
+            continue;
+        }
+        // Stream order is LSB-first: the low `len` index bits are the
+        // bit-reversed code, the rest is free (any following bits).
+        let rev = reverse_bits(code, len) as usize;
+        let step = 1usize << len;
+        let mut idx = rev;
+        while idx < 512 {
+            fast[idx] = (sym as u16, len);
+            idx += step;
+        }
+    }
+    Ok(DecodeTable {
+        fast,
+        tree: DecodeTree::build(lengths)?,
+    })
+}
+
+/// Fixed Huffman tables, built once and shared by every block.
+static FIXED_LIT_TABLE: OnceLock<DecodeTable> = OnceLock::new();
+static FIXED_DIST_TABLE: OnceLock<DecodeTable> = OnceLock::new();
+
+fn fixed_lit_table() -> &'static DecodeTable {
+    FIXED_LIT_TABLE.get_or_init(|| build_table(&fixed_lit_lengths()).expect("fixed table"))
+}
+
+fn fixed_dist_table() -> &'static DecodeTable {
+    FIXED_DIST_TABLE.get_or_init(|| build_table(&fixed_dist_lengths()).expect("fixed table"))
 }
 
 fn fixed_lit_lengths() -> [u8; 288] {
@@ -372,12 +501,10 @@ pub(crate) fn decompress_raw_with_consumed(
                 out.extend_from_slice(r.read_bytes(len as usize)?);
             }
             1 => {
-                let lit = DecodeTree::build(&fixed_lit_lengths())?;
-                let dist = DecodeTree::build(&fixed_dist_lengths())?;
-                decode_huffman_block(&mut r, &mut out, &lit, &dist, max_output)?;
+                decode_huffman_block(&mut r, &mut out, fixed_lit_table(), fixed_dist_table(), max_output)?;
             }
             2 => {
-                let (lit, dist) = read_dynamic_trees(&mut r)?;
+                let (lit, dist) = read_dynamic_tables(&mut r)?;
                 decode_huffman_block(&mut r, &mut out, &lit, &dist, max_output)?;
             }
             _ => return Err(invalid("reserved deflate block type")),
@@ -389,8 +516,8 @@ pub(crate) fn decompress_raw_with_consumed(
 fn decode_huffman_block(
     r: &mut BitReader,
     out: &mut Vec<u8>,
-    lit: &DecodeTree,
-    dist: &DecodeTree,
+    lit: &DecodeTable,
+    dist: &DecodeTable,
     max_output: usize,
 ) -> Result<()> {
     loop {
@@ -419,9 +546,22 @@ fn decode_huffman_block(
                 if out.len() + len > max_output {
                     return Err(invalid("deflate output exceeds limit"));
                 }
-                for _ in 0..len {
-                    let b = out[out.len() - dist];
-                    out.push(b);
+                // Overlapping matches expand byte-by-byte (run length), so a
+                // plain memmove would copy stale bytes when dist < len.
+                // Copy in dist-sized chunks: every chunk source is fully
+                // written, and chunks never self-overlap.
+                let base = out.len();
+                if dist == 1 {
+                    let b = out[base - 1];
+                    out.resize(base + len, b);
+                } else {
+                    out.resize(base + len, 0);
+                    let mut i = 0;
+                    while i < len {
+                        let chunk = (len - i).min(dist);
+                        out.copy_within(base - dist + i..base - dist + i + chunk, base + i);
+                        i += chunk;
+                    }
                 }
             }
             _ => return Err(invalid("invalid literal/length symbol")),
@@ -433,7 +573,7 @@ const CODE_LENGTH_ORDER: [usize; 19] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 ];
 
-fn read_dynamic_trees(r: &mut BitReader) -> Result<(DecodeTree, DecodeTree)> {
+fn read_dynamic_tables(r: &mut BitReader) -> Result<(DecodeTable, DecodeTable)> {
     let hlit = r.read_bits_le(5)? as usize + 257;
     let hdist = r.read_bits_le(5)? as usize + 1;
     let hclen = r.read_bits_le(4)? as usize + 4;
@@ -444,13 +584,13 @@ fn read_dynamic_trees(r: &mut BitReader) -> Result<(DecodeTree, DecodeTree)> {
     for i in 0..hclen {
         cl_lengths[CODE_LENGTH_ORDER[i]] = r.read_bits_le(3)? as u8;
     }
-    let cl_tree = DecodeTree::build(&cl_lengths)?;
+    let cl_table = build_table(&cl_lengths)?;
     let total = hlit + hdist;
     let mut lengths = vec![0u8; total];
     let mut i = 0;
     let mut prev = 0u8;
     while i < total {
-        let sym = r.read_code(&cl_tree)?;
+        let sym = BitReader::read_code(r, &cl_table)?;
         match sym {
             0..=15 => {
                 lengths[i] = sym as u8;
@@ -494,12 +634,12 @@ fn read_dynamic_trees(r: &mut BitReader) -> Result<(DecodeTree, DecodeTree)> {
     }
     // RFC 1951: a single distance code of length 0 is encoded as one code,
     // it must still decode (incomplete use is an error later).
-    let lit = DecodeTree::build(&lengths[..hlit])?;
+    let lit = build_table(&lengths[..hlit])?;
     let mut dist_lengths = lengths[hlit..].to_vec();
     if dist_lengths.len() == 1 && dist_lengths[0] == 0 {
         dist_lengths.push(0);
     }
-    let dist = DecodeTree::build(&dist_lengths)?;
+    let dist = build_table(&dist_lengths)?;
     Ok((lit, dist))
 }
 
@@ -524,6 +664,33 @@ fn hash3(b0: u8, b1: u8, b2: u8) -> usize {
     h as usize
 }
 
+/// Match length of `a` vs `b`, capped at `max` (8-byte chunks, then tail).
+#[inline]
+fn match_len(a: &[u8], b: &[u8], max: usize) -> usize {
+    let mut len = 0usize;
+    while len + 8 <= max {
+        let x = u64::from_le_bytes(a[len..len + 8].try_into().unwrap());
+        let y = u64::from_le_bytes(b[len..len + 8].try_into().unwrap());
+        if x == y {
+            len += 8;
+        } else {
+            return len + ((x ^ y).trailing_zeros() as usize / 8);
+        }
+    }
+    while len < max && a[len] == b[len] {
+        len += 1;
+    }
+    len
+}
+
+/// Pre-reverse canonical codes for LSB-first emission.
+fn reversed_codes(codes: Vec<(u32, u8)>) -> Vec<(u32, u8)> {
+    codes
+        .into_iter()
+        .map(|(c, l)| (reverse_bits(c, l), l))
+        .collect()
+}
+
 /// Compress raw bytes into a raw DEFLATE stream.
 pub fn compress_raw(data: &[u8], level: CompressionLevel) -> Vec<u8> {
     if data.is_empty() {
@@ -545,8 +712,8 @@ pub fn compress_raw(data: &[u8], level: CompressionLevel) -> Vec<u8> {
     let mut prev = vec![u32::MAX; n];
 
     let mut w = BitWriter::new();
-    let fixed_codes = canonical_codes(&fixed_lit_lengths());
-    let fixed_dist = canonical_codes(&fixed_dist_lengths());
+    let fixed_codes = reversed_codes(canonical_codes(&fixed_lit_lengths()));
+    let fixed_dist = reversed_codes(canonical_codes(&fixed_dist_lengths()));
 
     let mut pos = 0usize;
     // Tokens of the current block plus uncompressed byte count.
@@ -570,12 +737,9 @@ pub fn compress_raw(data: &[u8], level: CompressionLevel) -> Vec<u8> {
                 if c < window_start {
                     break;
                 }
-                // Quick first-byte check, then extend.
+                // Extend candidate matches 8 bytes at a time.
                 if data[c] == data[pos] {
-                    let mut len = 1usize;
-                    while len < max_len && data[c + len] == data[pos + len] {
-                        len += 1;
-                    }
+                    let len = match_len(&data[c..], &data[pos..], max_len);
                     if len >= MIN_MATCH && len > best_len {
                         best_len = len;
                         best_dist = pos - c;
@@ -734,22 +898,22 @@ fn emit_fixed(
         match *t {
             Token::Literal(b) => {
                 let (c, l) = fixed_codes[b as usize];
-                w.write_code_msb(c, l);
+                w.write_code_rev(c, l);
             }
             Token::Match { len, dist } => {
                 let (lsym, lval, lextra) = length_symbol(len);
                 let (c, l) = fixed_codes[lsym as usize];
-                w.write_code_msb(c, l);
+                w.write_code_rev(c, l);
                 w.write_bits_le(lval, lextra);
                 let (dsym, dval, dextra) = dist_symbol(dist);
                 let (c, l) = fixed_dist[dsym as usize];
-                w.write_code_msb(c, l);
+                w.write_code_rev(c, l);
                 w.write_bits_le(dval, dextra);
             }
         }
     }
     let (c, l) = fixed_codes[256];
-    w.write_code_msb(c, l);
+    w.write_code_rev(c, l);
 }
 
 #[cfg(test)]

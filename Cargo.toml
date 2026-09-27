@@ -18,3 +18,7 @@ readme = "README.md"
 fishfile = { version = "26.1", path = "../FishFile" }
 
 [dev-dependencies]
+# Benchmark-only competitors (never used by the library itself).
+flate2 = "1"
+zip = "2"
+tar = "0.4"
