@@ -1,0 +1,18 @@
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[package]
+name = "archivekit"
+version = "26.1.0"
+edition = "2021"
+authors = ["arlomu"]
+description = "ArchiveKit – ZIP, GZIP and TAR compression for TontooOS. 100% hand-written, zero dependencies."
+license = "TCL"
+repository = "https://github.com/TontooOS/ArchiveKit"
+keywords = ["tontoo", "archive", "zip", "gzip", "tar", "compression"]
+categories = ["compression", "encoding"]
+readme = "README.md"
+
+[dependencies]
+
+[dev-dependencies]
