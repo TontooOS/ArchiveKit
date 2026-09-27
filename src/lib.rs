@@ -1,8 +1,10 @@
-//! ArchiveKit – ZIP, GZIP and TAR for TontooOS.
+//! ArchiveKit – ZIP, GZIP, TAR and `.app` containers for TontooOS.
 //!
 //! 100% hand-written compression: DEFLATE (RFC 1951), GZIP (RFC 1952),
 //! TAR (ustar/PAX/GNU) and ZIP (Stored + Deflate, ZIP64, UTF-8, data
-//! descriptors). Zero dependencies – only `std`.
+//! descriptors). The `.app` container (TAPP) adds indexed single-file apps
+//! with FishFile manifests and `.tico` icons. Codecs are dependency-free
+//! (`std` only); only the app manifest uses FishFile.
 //!
 //! # Quick Start
 //!
@@ -19,6 +21,7 @@
 //! assert_eq!(entries[0].data, b"hello tgz");
 //! ```
 
+pub mod app;
 pub mod combined;
 pub mod crc;
 pub mod deflate;
@@ -39,6 +42,11 @@ pub use combined::{
     list_names, pack_dir_to_archive, tar_gzip_compress, tar_gzip_compress_files,
     tar_gzip_decompress, Format,
 };
+pub use app::{
+    app_extract_to_file, app_pack_dir, validate_tico, AppBuilder, AppEntryMeta, AppManifest,
+    AppMethod, AppReader, TicoInfo, APP_EXTENSION, APP_FOOTER_MAGIC, APP_MAGIC, APP_MANIFEST_NAME,
+    APP_VERSION,
+};
 pub use deflate::CompressionLevel;
 pub use error::{ArchiveError, Result};
 pub use gzip::{
@@ -51,6 +59,7 @@ pub use zip::{zip_pack, zip_unpack, ZipEntry, ZipMethod, ZipReader, ZipWriter, Z
 
 /// Convenience prelude.
 pub mod prelude {
+    pub use crate::app::{AppManifest, AppMethod};
     pub use crate::combined::Format;
     pub use crate::deflate::CompressionLevel;
     pub use crate::error::{ArchiveError, Result};

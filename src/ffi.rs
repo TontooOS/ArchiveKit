@@ -47,6 +47,7 @@ fn format_from_int(format: c_int) -> Result<Format, ()> {
         2 => Ok(Format::Gzip),
         3 => Ok(Format::Tar),
         4 => Ok(Format::TarGzip),
+        5 => Ok(Format::App),
         _ => {
             set_error(format!("unknown format code {format}"));
             Err(())
@@ -211,6 +212,7 @@ pub unsafe extern "C" fn archivekit_detect_format(input: *const u8, input_len: u
         Some(Format::Gzip) => 2,
         Some(Format::Tar) => 3,
         Some(Format::TarGzip) => 4,
+        Some(Format::App) => 5,
         None => 0,
     }
 }
@@ -323,8 +325,7 @@ pub unsafe extern "C" fn archivekit_pack_dir(
 pub unsafe extern "C" fn archivekit_list_names(
     input: *const u8,
     input_len: usize,
-) -> *mut c_char {
-    clear_error();
+) -> *mut c_char {    clear_error();
     if input.is_null() || input_len == 0 {
         set_error("null or empty input".to_string());
         return ptr::null_mut();
@@ -344,6 +345,221 @@ pub unsafe extern "C" fn archivekit_list_names(
         Err(e) => {
             set_error(e.to_string());
             ptr::null_mut()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// .app containers (random access)
+// ---------------------------------------------------------------------------
+
+/// Opaque random-access `.app` reader (see `archivekit_app_open`).
+pub struct CAppReader {
+    inner: crate::AppReader<std::fs::File>,
+}
+
+/// Open a `.app` container for random access.
+///
+/// Only the footer plus the central directory are read; hundred-megabyte
+/// apps open in milliseconds.
+///
+/// # Safety
+/// `path` must be a valid NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn archivekit_app_open(path: *const c_char) -> *mut CAppReader {
+    clear_error();
+    let Ok(path) = cstr_to_path(path) else {
+        return ptr::null_mut();
+    };
+    match crate::AppReader::open(&path) {
+        Ok(inner) => Box::into_raw(Box::new(CAppReader { inner })),
+        Err(e) => {
+            set_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Close a reader opened with `archivekit_app_open`.
+///
+/// # Safety
+/// `handle` must come from `archivekit_app_open` (NULL is ignored).
+#[no_mangle]
+pub unsafe extern "C" fn archivekit_app_close(handle: *mut CAppReader) {
+    if !handle.is_null() {
+        drop(unsafe { Box::from_raw(handle) });
+    }
+}
+
+/// List entry names as newline-separated UTF-8 (free with
+/// `archivekit_free_string`), or NULL on error.
+///
+/// # Safety
+/// `handle` must be a live reader from `archivekit_app_open`.
+#[no_mangle]
+pub unsafe extern "C" fn archivekit_app_list(handle: *mut CAppReader) -> *mut c_char {
+    clear_error();
+    if handle.is_null() {
+        set_error("null app handle".to_string());
+        return ptr::null_mut();
+    }
+    let reader = unsafe { &mut *handle };
+    match CString::new(reader.inner.list_names().join("\n")) {
+        Ok(s) => s.into_raw(),
+        Err(_) => {
+            set_error("entry names contain NUL".to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Read one entry by full container path, e.g. `Foo.app/App/foo`.
+///
+/// Only this entry's bytes are read and decoded.
+///
+/// # Safety
+/// `handle` must be live; `name` valid NUL-terminated; `out_len` writable.
+#[no_mangle]
+pub unsafe extern "C" fn archivekit_app_read(
+    handle: *mut CAppReader,
+    name: *const c_char,
+    out_len: *mut usize,
+) -> *mut u8 {
+    clear_error();
+    if handle.is_null() || name.is_null() {
+        set_error("null pointer".to_string());
+        return ptr::null_mut();
+    }
+    let reader = unsafe { &mut *handle };
+    let name = unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned();
+    match reader.inner.read_file(&name) {
+        Ok(out) => return_buffer(out, out_len),
+        Err(e) => {
+            set_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Read one manifest field: `bundle_id`, `version`, `executable`, `icon`
+/// or `name:<locale>` (e.g. `name:de_de`).
+///
+/// Returns an owned string (free with `archivekit_free_string`) or NULL.
+///
+/// # Safety
+/// `handle` must be live; `field` valid NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn archivekit_app_manifest(
+    handle: *mut CAppReader,
+    field: *const c_char,
+) -> *mut c_char {
+    clear_error();
+    if handle.is_null() || field.is_null() {
+        set_error("null pointer".to_string());
+        return ptr::null_mut();
+    }
+    let reader = unsafe { &mut *handle };
+    let field = unsafe { CStr::from_ptr(field) }.to_string_lossy().into_owned();
+    let value = match reader.inner.read_manifest() {
+        Ok(m) => {
+            if field == "bundle_id" {
+                Some(m.bundle_id)
+            } else if field == "version" {
+                Some(m.version)
+            } else if field == "executable" {
+                Some(m.executable)
+            } else if field == "icon" {
+                m.icon
+            } else if let Some(locale) = field.strip_prefix("name:") {
+                m.name(locale).map(|s| s.to_string())
+            } else {
+                None
+            }
+        }
+        Err(e) => {
+            set_error(e.to_string());
+            return ptr::null_mut();
+        }
+    };
+    match value {
+        Some(v) => match CString::new(v) {
+            Ok(s) => s.into_raw(),
+            Err(_) => {
+                set_error("manifest value contains NUL".to_string());
+                ptr::null_mut()
+            }
+        },
+        None => {
+            set_error(format!("unknown manifest field '{field}'"));
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Extract a `.app` container into a directory.
+///
+/// Returns 0 on success, negative on error.
+///
+/// # Safety
+/// `src` and `dst_dir` must be valid NUL-terminated strings.
+#[no_mangle]
+pub unsafe extern "C" fn archivekit_app_extract(
+    src: *const c_char,
+    dst_dir: *const c_char,
+) -> c_int {
+    clear_error();
+    let (Ok(src), Ok(dst)) = (cstr_to_path(src), cstr_to_path(dst_dir)) else {
+        return -1;
+    };
+    match crate::app::app_extract_to_file(&src, &dst) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(e.to_string());
+            -2
+        }
+    }
+}
+
+/// Pack a staging tree (`App/`, `Resources/`, `Info.tontoo`) into a `.app`.
+///
+/// Returns 0 on success, negative on error.
+///
+/// # Safety
+/// All three pointers must be valid NUL-terminated strings.
+#[no_mangle]
+pub unsafe extern "C" fn archivekit_app_pack(
+    staging_dir: *const c_char,
+    dst: *const c_char,
+    app_name: *const c_char,
+) -> c_int {
+    clear_error();
+    let (Ok(staging), Ok(dst), Ok(app_name)) = (
+        cstr_to_path(staging_dir),
+        cstr_to_path(dst),
+        cstr_to_path(app_name),
+    ) else {
+        return -1;
+    };
+    let app_name = app_name.to_string_lossy().into_owned();
+    match crate::app::app_pack_dir(&staging, &app_name, None) {
+        Ok(bytes) => {
+            if let Some(parent) = dst.parent() {
+                if !parent.as_os_str().is_empty() && std::fs::create_dir_all(parent).is_err() {
+                    set_error("cannot create parent directory".to_string());
+                    return -3;
+                }
+            }
+            match std::fs::write(&dst, bytes) {
+                Ok(()) => 0,
+                Err(e) => {
+                    set_error(e.to_string());
+                    -2
+                }
+            }
+        }
+        Err(e) => {
+            set_error(e.to_string());
+            -2
         }
     }
 }

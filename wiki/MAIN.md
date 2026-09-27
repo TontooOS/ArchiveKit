@@ -1,6 +1,6 @@
 # TontooArchiveKit – Wiki
 
-ZIP, GZIP and TAR compression for TontooOS. 100% hand-written DEFLATE, CRC32, TAR and ZIP codecs with zero dependencies (only `std`).
+ZIP, GZIP, TAR and `.app` single-file containers for TontooOS. Hand-written DEFLATE, CRC32, TAR and ZIP codecs (dependency-free) plus indexed TAPP app containers with FishFile manifests and `.tico` icons.
 
 - Repository: https://github.com/TontooOS/ArchiveKit
 - License: TCL v26.1
@@ -16,6 +16,7 @@ ZIP, GZIP and TAR compression for TontooOS. 100% hand-written DEFLATE, CRC32, TA
 | Gzip | [Gzip.md](Gzip.md) | GZIP members, multi-member streams, streaming API |
 | Tar | [Tar.md](Tar.md) | TAR reader/writer, PAX, GNU long names, directory I/O |
 | Zip | [Zip.md](Zip.md) | ZIP reader/writer, ZIP64, UTF-8, data descriptors |
+| App | [App.md](App.md) | `.app` containers, manifest, tico icons, random access |
 | Combined | [Combined.md](Combined.md) | tar.gz pipeline, format detection, file and dir APIs |
 | Error | [Error.md](Error.md) | Error types and handling |
 | FFI | [Ffi.md](Ffi.md) | C header and interop |
@@ -49,9 +50,10 @@ int main(void) {
 }
 ```
 
-See [Combined.md](Combined.md), [Zip.md](Zip.md), [Gzip.md](Gzip.md) and
+See [Combined.md](Combined.md), [App.md](App.md), [Zip.md](Zip.md), [Gzip.md](Gzip.md) and
 [Tar.md](Tar.md) for details.
 
 ## Changelog
 
+- 2026-09-27: Added `.app` containers (TAPP) with FishFile manifest, tico icons and random access
 - 2026-09-27: Initial wiki for ArchiveKit 26.1.0

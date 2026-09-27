@@ -26,14 +26,18 @@ pub enum Format {
     Tar,
     /// GZIP-compressed TAR (`.tar.gz`, `.tgz`).
     TarGzip,
+    /// TontooOS app container (`.app`, TAPP with central directory).
+    App,
 }
 
 impl Format {
-    /// Detect from a file extension (`.zip`, `.gz`, `.tar`, `.tar.gz`, `.tgz`).
+    /// Detect from a file extension (`.zip`, `.gz`, `.tar`, `.tar.gz`, `.tgz`, `.app`).
     pub fn from_extension(path: &Path) -> Option<Self> {
         let name = path.file_name()?.to_string_lossy().to_lowercase();
         if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
             Some(Format::TarGzip)
+        } else if name.ends_with(".app") {
+            Some(Format::App)
         } else if name.ends_with(".zip") {
             Some(Format::Zip)
         } else if name.ends_with(".gz") {
@@ -52,6 +56,7 @@ impl Format {
             Format::Gzip => "gz",
             Format::Tar => "tar",
             Format::TarGzip => "tar.gz",
+            Format::App => "app",
         }
     }
 }
@@ -62,6 +67,11 @@ impl Format {
 /// TAR is reported as [`Format::Gzip`]; use the file extension (or a trial
 /// TAR parse of the payload) to distinguish plain GZIP from TAR+GZIP.
 pub fn detect_format(data: &[u8]) -> Option<Format> {
+    if data.len() >= 8
+        && u32::from_le_bytes([data[0], data[1], data[2], data[3]]) == crate::app::APP_MAGIC
+    {
+        return Some(Format::App);
+    }
     if data.len() >= 2 && data[0] == 0x1F && data[1] == 0x8B {
         return Some(Format::Gzip);
     }
@@ -133,6 +143,9 @@ pub fn compress_bytes(data: &[u8], format: Format, level: CompressionLevel) -> R
         Format::TarGzip => Err(invalid(
             "tar.gz needs entries: use tar_gzip_compress() instead",
         )),
+        Format::App => Err(invalid(
+            "app needs a manifest and tree: use AppBuilder or app_pack_dir() instead",
+        )),
     }
 }
 
@@ -152,6 +165,9 @@ pub fn decompress_bytes(data: &[u8], format: Format) -> Result<Vec<u8>> {
         Format::Gzip => gzip_decompress(data),
         Format::Tar => Ok(data.to_vec()),
         Format::TarGzip => tar_gzip_decompress_raw(data),
+        Format::App => Err(invalid(
+            "app needs indexed access: use AppReader::read_file() instead",
+        )),
     }
 }
 
@@ -195,6 +211,24 @@ pub fn pack_dir_to_archive(dir: &Path, format: Format, level: CompressionLevel) 
         }
         Format::Zip => zip_dir(dir, level),
         Format::Gzip => Err(invalid("gzip packs a single stream, not a directory")),
+        Format::App => {
+            // Adopt the fico manifest; the top prefix comes from its name.
+            let text = fs::read_to_string(dir.join(crate::app::APP_MANIFEST_NAME))
+                .map_err(|_| invalid("app dir has no Info.tontoo manifest"))?;
+            let manifest = crate::app::AppManifest::from_fico(&text)?;
+            let top_name = manifest
+                .display_name()
+                .ok_or_else(|| invalid("app manifest has no name"))?
+                .to_string();
+            let mut builder = crate::app::AppBuilder::new(&top_name)?;
+            builder.set_manifest(manifest);
+            if level == CompressionLevel::None {
+                builder.pack_tree(dir)?;
+            } else {
+                builder.pack_tree_compressed(dir, level)?;
+            }
+            builder.finish()
+        }
     }
 }
 
@@ -263,6 +297,7 @@ pub fn list_names(data: &[u8]) -> Result<Vec<String>> {
             .map(|e| e.name.clone())
             .collect()),
         Some(Format::Tar) => Ok(tar_unpack(data)?.iter().map(|e| e.path.clone()).collect()),
+        Some(Format::App) => Ok(crate::app::AppReader::from_bytes(data)?.list_names()),
         _ => Err(invalid("unknown archive format")),
     }
 }
@@ -333,6 +368,17 @@ pub fn compress_file(src: &Path, dst: &Path, format: Option<Format>) -> Result<(
                 .ok_or_else(|| invalid("non-utf8 file name"))?;
             tar_gzip_compress(&[TarEntry::file(name, data)], level)
         }
+        Format::App => {
+            let meta = fs::symlink_metadata(src).map_err(ArchiveError::from)?;
+            if !meta.is_dir() {
+                return Err(invalid("app packs a directory tree, not a single file"));
+            }
+            let app_name = dst
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| invalid("bad destination name"))?;
+            crate::app::app_pack_dir(src, app_name, Some(level))?
+        }
     };
     if let Some(parent) = dst.parent() {
         if !parent.as_os_str().is_empty() {
@@ -383,6 +429,10 @@ pub fn extract_bytes(data: &[u8], src_hint: Option<&Path>, dst_dir: &Path) -> Re
     match detect_format(data) {
         Some(Format::Zip) => extract_zip(data, dst_dir),
         Some(Format::Tar) => tar_unpack_to_dir(data, dst_dir),
+        Some(Format::App) => {
+            let mut reader = crate::app::AppReader::from_bytes(data)?;
+            reader.extract_to(dst_dir)
+        }
         Some(Format::Gzip) => {
             // Plain gzip: maybe a tar payload without the extension.
             let raw = gzip_decompress(data)?;

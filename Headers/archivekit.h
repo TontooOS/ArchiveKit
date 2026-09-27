@@ -1,8 +1,8 @@
 /*
  * ArchiveKit - C Header
- * ZIP, GZIP and TAR compression for TontooOS (100% hand-written, no dependencies)
+ * ZIP, GZIP, TAR and .app containers for TontooOS (codecs hand-written)
  *
- * Format codes: 1 = zip, 2 = gzip, 3 = tar, 4 = tar.gz
+ * Format codes: 1 = zip, 2 = gzip, 3 = tar, 4 = tar.gz, 5 = app
  * Compression levels: 0 = none (stored), 1 = fastest, 2 = balanced, 3 = best
  */
 
@@ -90,7 +90,7 @@ uint8_t* archivekit_tar_gzip_compress(const uint8_t *input, size_t input_len, in
  *
  * @param input input bytes
  * @param input_len input length
- * @return 0 = unknown, 1 = zip, 2 = gzip, 3 = tar, 4 = tar.gz
+ * @return 0 = unknown, 1 = zip, 2 = gzip, 3 = tar, 4 = tar.gz, 5 = app
  */
 int archivekit_detect_format(const uint8_t *input, size_t input_len);
 
@@ -112,7 +112,7 @@ char* archivekit_list_names(const uint8_t *input, size_t input_len);
  *
  * @param src source file or directory
  * @param dst destination archive
- * @param format 1 = zip, 2 = gzip, 3 = tar, 4 = tar.gz
+ * @param format 1 = zip, 2 = gzip, 3 = tar, 4 = tar.gz, 5 = app (dir only)
  * @return 0 on success, negative on error (see archivekit_last_error)
  */
 int archivekit_compress_file(const char *src, const char *dst, int format);
@@ -131,11 +131,80 @@ int archivekit_extract(const char *src, const char *dst_dir);
  *
  * @param src_dir source directory
  * @param dst destination archive
- * @param format 1 = zip, 2 = gzip (rejected), 3 = tar, 4 = tar.gz
+ * @param format 1 = zip, 2 = gzip (rejected), 3 = tar, 4 = tar.gz, 5 = app
  * @param level 0..3
  * @return 0 on success, negative on error
  */
 int archivekit_pack_dir(const char *src_dir, const char *dst, int format, int level);
+
+/* ======================== */
+/* .app containers          */
+/* ======================== */
+
+/** Opaque random-access .app reader. */
+typedef struct CAppReader CAppReader;
+
+/**
+ * Open a .app container (reads footer + central directory only).
+ *
+ * @param path container file
+ * @return handle or NULL on error (see archivekit_last_error)
+ */
+CAppReader* archivekit_app_open(const char *path);
+
+/**
+ * Close a reader.
+ *
+ * @param handle handle or NULL (ignored)
+ */
+void archivekit_app_close(CAppReader *handle);
+
+/**
+ * List entry names as newline-separated UTF-8.
+ *
+ * @param handle live reader
+ * @return string (free with archivekit_free_string) or NULL on error
+ */
+char* archivekit_app_list(CAppReader *handle);
+
+/**
+ * Read one entry (only its bytes are decoded).
+ *
+ * @param handle live reader
+ * @param name full container path, e.g. "Foo.app/App/foo"
+ * @param out_len output: payload length
+ * @return heap buffer (free with archivekit_free_buffer) or NULL on error
+ */
+uint8_t* archivekit_app_read(CAppReader *handle, const char *name, size_t *out_len);
+
+/**
+ * Read a manifest field: "bundle_id", "version", "executable", "icon"
+ * or "name:<locale>".
+ *
+ * @param handle live reader
+ * @param field field name
+ * @return string (free with archivekit_free_string) or NULL on error
+ */
+char* archivekit_app_manifest(CAppReader *handle, const char *field);
+
+/**
+ * Extract a .app container into a directory.
+ *
+ * @param src container file
+ * @param dst_dir destination directory
+ * @return 0 on success, negative on error
+ */
+int archivekit_app_extract(const char *src, const char *dst_dir);
+
+/**
+ * Pack a staging tree (App/, Resources/, Info.tontoo) into a .app.
+ *
+ * @param staging_dir staging directory
+ * @param dst destination .app file
+ * @param app_name top prefix stem, e.g. "Foo" for "Foo.app/"
+ * @return 0 on success, negative on error
+ */
+int archivekit_app_pack(const char *staging_dir, const char *dst, const char *app_name);
 
 #ifdef __cplusplus
 }

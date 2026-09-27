@@ -1,6 +1,6 @@
 # FFI
 
-C bindings for ArchiveKit (`Headers/archivekit.h`, implemented in `src/ffi.rs`). All functions are `no_mangle extern "C"`. Format codes are `1 = zip`, `2 = gzip`, `3 = tar`, `4 = tar.gz`; levels are `0 = none`, `1 = fastest`, `2 = balanced`, `3 = best`.
+C bindings for ArchiveKit (`Headers/archivekit.h`, implemented in `src/ffi.rs`). All functions are `no_mangle extern "C"`. Format codes are `1 = zip`, `2 = gzip`, `3 = tar`, `4 = tar.gz`, `5 = app`; levels are `0 = none`, `1 = fastest`, `2 = balanced`, `3 = best`.
 
 ## Memory Rules
 
@@ -89,6 +89,7 @@ int archivekit_detect_format(const uint8_t *input, size_t input_len);
 | 2 | GZIP |
 | 3 | TAR |
 | 4 | TAR+GZIP hint (reserved; currently reported as 2) |
+| 5 | App (TAPP container) |
 
 ### `archivekit_list_names`
 
@@ -164,7 +165,75 @@ int main(void) {
 }
 ```
 
+## App Containers
+
+Opaque random-access `.app` readers. Only the footer plus the central directory are read on open; `archivekit_app_read` decodes a single entry.
+
+### `archivekit_app_open` / `archivekit_app_close`
+
+```c
+CAppReader* archivekit_app_open(const char *path);
+void archivekit_app_close(CAppReader *handle);
+```
+
+| Return (`open`) | Meaning |
+|---|---|
+| handle | Live reader |
+| NULL | Failure; check `archivekit_last_error` |
+
+`close` accepts NULL.
+
+### `archivekit_app_list`
+
+```c
+char* archivekit_app_list(CAppReader *handle);
+```
+
+| Return | Meaning |
+|---|---|
+| pointer | Newline-separated entry names (free with `archivekit_free_string`) |
+| NULL | Failure |
+
+### `archivekit_app_read`
+
+```c
+uint8_t* archivekit_app_read(CAppReader *handle, const char *name, size_t *out_len);
+```
+
+| Return | Meaning |
+|---|---|
+| pointer | Entry payload (free with `archivekit_free_buffer`) |
+| NULL | Missing entry or corrupt data |
+
+### `archivekit_app_manifest`
+
+```c
+char* archivekit_app_manifest(CAppReader *handle, const char *field);
+```
+
+`field` is `bundle_id`, `version`, `executable`, `icon` or `name:<locale>`.
+
+| Return | Meaning |
+|---|---|
+| pointer | Field value (free with `archivekit_free_string`) |
+| NULL | Unknown field or unreadable manifest |
+
+### `archivekit_app_extract` / `archivekit_app_pack`
+
+```c
+int archivekit_app_extract(const char *src, const char *dst_dir);
+int archivekit_app_pack(const char *staging_dir, const char *dst, const char *app_name);
+```
+
+| Return | Meaning |
+|---|---|
+| 0 | Success |
+| -1 | Bad arguments |
+| -2 | Operation failed; check `archivekit_last_error` |
+| -3 | (`pack` only) parent directory of `dst` cannot be created |
+
 ## Cross References
 
 - [Combined.md](Combined.md) – Rust counterparts of the file helpers
+- [App.md](App.md) – container layout, manifest schema, tico rules
 - [Error.md](Error.md) – error meanings behind `archivekit_last_error`

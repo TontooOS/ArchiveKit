@@ -6,13 +6,15 @@ name = "archivekit"
 version = "26.1.0"
 edition = "2021"
 authors = ["arlomu"]
-description = "ArchiveKit – ZIP, GZIP and TAR compression for TontooOS. 100% hand-written, zero dependencies."
+description = "ArchiveKit – ZIP, GZIP, TAR and .app containers for TontooOS. Hand-written codecs, zero dependencies except FishFile for app manifests."
 license = "TCL"
 repository = "https://github.com/TontooOS/ArchiveKit"
-keywords = ["tontoo", "archive", "zip", "gzip", "tar", "compression"]
+keywords = ["tontoo", "archive", "zip", "gzip", "tar", "compression", "app"]
 categories = ["compression", "encoding"]
 readme = "README.md"
 
 [dependencies]
+# App manifests (.fico) via FishFile; the codecs stay dependency-free.
+fishfile = { version = "26.1", path = "../FishFile" }
 
 [dev-dependencies]
