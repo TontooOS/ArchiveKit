@@ -241,14 +241,12 @@ fn bench_zip(text: &[u8], rand: &[u8]) {
         w.finish()
     });
     let ak_stored2 = ak_stored.clone();
-    let (lms, _) = time_it(|| archivekit::zip_unpack(black_box(&ak_stored2)).unwrap().len());
+    let (lms, _) = time_it(|| archivekit::ZipReader::new(black_box(&ak_stored2)).read_index().unwrap().len());
     let (rms, _) = time_it(|| {
-        archivekit::zip_unpack(black_box(&ak_stored2))
-            .unwrap()
-            .into_iter()
-            .find(|e| e.name == "root.txt")
-            .unwrap()
-            .data
+        let r = archivekit::ZipReader::new(black_box(&ak_stored2));
+        let idx = r.read_index().unwrap();
+        let hit = archivekit::ZipReader::find_in_index(&idx, "root.txt").unwrap();
+        r.read_one(&hit).unwrap().data
     });
     let (ums, _) = time_it(|| archivekit::zip_unpack(black_box(&ak_stored2)).unwrap());
     println!(
@@ -274,14 +272,12 @@ fn bench_zip(text: &[u8], rand: &[u8]) {
         assert_eq!(back.iter().find(|e| e.name == "docs/a.txt").unwrap().data, files[0].1);
     }
     let ak_def2 = ak_def.clone();
-    let (lms, _) = time_it(|| archivekit::zip_unpack(black_box(&ak_def2)).unwrap().len());
+    let (lms, _) = time_it(|| archivekit::ZipReader::new(black_box(&ak_def2)).read_index().unwrap().len());
     let (rms, _) = time_it(|| {
-        archivekit::zip_unpack(black_box(&ak_def2))
-            .unwrap()
-            .into_iter()
-            .find(|e| e.name == "root.txt")
-            .unwrap()
-            .data
+        let r = archivekit::ZipReader::new(black_box(&ak_def2));
+        let idx = r.read_index().unwrap();
+        let hit = archivekit::ZipReader::find_in_index(&idx, "root.txt").unwrap();
+        r.read_one(&hit).unwrap().data
     });
     let (ums, _) = time_it(|| archivekit::zip_unpack(black_box(&ak_def2)).unwrap());
     println!(

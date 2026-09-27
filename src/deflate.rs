@@ -139,6 +139,9 @@ impl<'a> BitReader<'a> {
                 return Ok(sym);
             }
         }
+        // Longer than the peek: commit the walked prefix, then continue
+        // with fresh stream bits (never re-read bit 0).
+        self.consume(TABLE_BITS);
         loop {
             let b = self.read_bit()? as usize;
             node = tree.next(node, b)?;
@@ -691,6 +694,299 @@ fn reversed_codes(codes: Vec<(u32, u8)>) -> Vec<(u32, u8)> {
         .collect()
 }
 
+/// Optimal-ish Huffman code lengths, capped at `max_len`.
+///
+/// Builds a Huffman tree (simple O(n^2) construction – alphabets are tiny),
+/// then halves all frequencies and retries while any length exceeds the cap.
+/// Scaling converges to a near-uniform distribution whose depth is bounded
+/// by ceil(log2(symbols)) + 1, so the loop always terminates.
+fn huffman_lengths(freqs: &[u32], max_len: u8) -> Vec<u8> {
+    let n = freqs.len();
+    let mut lens = vec![0u8; n];
+    let active: Vec<usize> = (0..n).filter(|&i| freqs[i] > 0).collect();
+    if active.is_empty() {
+        return lens;
+    }
+    if active.len() == 1 {
+        lens[active[0]] = 1;
+        return lens;
+    }
+    let mut scaled: Vec<u32> = freqs.to_vec();
+    for _ in 0..24 {
+        // Arena nodes: (freq, left, right, symbol). Leaves carry a symbol.
+        struct Node {
+            freq: u64,
+            left: usize,
+            right: usize,
+            sym: Option<usize>,
+        }
+        let mut arena: Vec<Node> = Vec::new();
+        let mut roots: Vec<usize> = Vec::new();
+        for &s in &active {
+            arena.push(Node {
+                freq: scaled[s] as u64,
+                left: usize::MAX,
+                right: usize::MAX,
+                sym: Some(s),
+            });
+            roots.push(arena.len() - 1);
+        }
+        while roots.len() > 1 {
+            // Two smallest roots (linear scan is fine for <= 286 symbols).
+            let mut m1 = 0usize;
+            for i in 1..roots.len() {
+                if arena[roots[i]].freq < arena[roots[m1]].freq {
+                    m1 = i;
+                }
+            }
+            let a = roots.swap_remove(m1);
+            let mut m2 = 0usize;
+            for i in 1..roots.len() {
+                if arena[roots[i]].freq < arena[roots[m2]].freq {
+                    m2 = i;
+                }
+            }
+            let b = roots.swap_remove(m2);
+            arena.push(Node {
+                freq: arena[a].freq + arena[b].freq,
+                left: a,
+                right: b,
+                sym: None,
+            });
+            roots.push(arena.len() - 1);
+        }
+        // Depths via explicit stack.
+        let mut depths = vec![0u8; n];
+        let mut stack = vec![(*roots.first().unwrap(), 0u8)];
+        let mut worst = 0u8;
+        while let Some((idx, d)) = stack.pop() {
+            let node = &arena[idx];
+            if let Some(s) = node.sym {
+                depths[s] = d;
+                worst = worst.max(d);
+            } else {
+                stack.push((node.left, d + 1));
+                stack.push((node.right, d + 1));
+            }
+        }
+        if worst <= max_len {
+            return depths;
+        }
+        for f in scaled.iter_mut() {
+            *f = (*f / 2).max(1);
+        }
+    }
+    // Unreachable in practice (scaling converges); fall back to uniform.
+    let uniform = (active.len().next_power_of_two().trailing_zeros() as u8 + 1).min(max_len);
+    for &s in &active {
+        lens[s] = uniform.max(1);
+    }
+    lens
+}
+
+/// One run-length-encoded code-length symbol: (symbol, extra bits, value).
+type ClRun = (u8, u8, u32);
+
+/// Run-length encode code lengths per RFC 1951 section 3.2.7.
+/// Returns the runs plus symbol frequencies for the CL Huffman code.
+fn rle_code_lengths(lengths: &[u8]) -> (Vec<ClRun>, [u32; 19]) {
+    let mut runs: Vec<ClRun> = Vec::new();
+    let mut freq = [0u32; 19];
+    let mut emit = |sym: u8, extra_bits: u8, val: u32, freq: &mut [u32; 19]| {
+        runs.push((sym, extra_bits, val));
+        freq[sym as usize] += 1;
+    };
+    let mut i = 0;
+    while i < lengths.len() {
+        let v = lengths[i];
+        let mut run = 1;
+        while i + run < lengths.len() && lengths[i + run] == v {
+            run += 1;
+        }
+        if v == 0 {
+            let mut r = run;
+            while r >= 11 {
+                let take = r.min(138);
+                emit(18, 7, (take - 11) as u32, &mut freq);
+                r -= take;
+            }
+            if r >= 3 {
+                emit(17, 3, (r - 3) as u32, &mut freq);
+                r = 0;
+            }
+            while r > 0 {
+                emit(0, 0, 0, &mut freq);
+                r -= 1;
+            }
+        } else {
+            emit(v, 0, 0, &mut freq);
+            let mut r = run - 1;
+            while r >= 3 {
+                let take = r.min(6);
+                emit(16, 2, (take - 3) as u32, &mut freq);
+                r -= take;
+            }
+            while r > 0 {
+                emit(v, 0, 0, &mut freq);
+                r -= 1;
+            }
+        }
+        i += run;
+    }
+    (runs, freq)
+}
+
+/// A planned dynamic block: everything `emit_dynamic` needs.
+struct DynPlan {
+    lit_rev: Vec<(u32, u8)>,
+    dist_rev: Vec<(u32, u8)>,
+    cl_rev: Vec<(u32, u8)>,
+    hlit: usize,
+    hdist: usize,
+    hclen: usize,
+    runs: Vec<ClRun>,
+    cl_order_lens: Vec<u8>,
+    bits: usize,
+}
+
+/// Plan a dynamic-Huffman block from token frequencies.
+/// Returns `None` when the block has no matches (fixed/stored win anyway)
+///
+/// or when lengths cannot be represented.
+fn plan_dynamic(lit_freq: &[u32; 286], dist_freq: &[u32; 30]) -> Option<DynPlan> {
+    if dist_freq.iter().all(|&f| f == 0) {
+        return None;
+    }
+    let lit_lens = huffman_lengths(lit_freq, 15);
+    let dist_lens = huffman_lengths(dist_freq, 15);
+    if lit_lens.iter().any(|&l| l > 15) || dist_lens.iter().any(|&l| l > 15) {
+        return None;
+    }
+    let hlit = lit_lens.iter().rposition(|&l| l > 0).map(|i| i + 1).unwrap_or(257).max(257);
+    let hdist = dist_lens.iter().rposition(|&l| l > 0).map(|i| i + 1).unwrap_or(1).max(1);
+    if hlit > 288 || hdist > 32 {
+        return None;
+    }
+    let mut joined = Vec::with_capacity(hlit + hdist);
+    joined.extend_from_slice(&lit_lens[..hlit]);
+    joined.extend_from_slice(&dist_lens[..hdist]);
+    let (runs, cl_freq) = rle_code_lengths(&joined);
+    let cl_lens = huffman_lengths(&cl_freq, 7);
+    if cl_lens.iter().any(|&l| l > 7) {
+        return None;
+    }
+    // HCLEN covers the used prefix of the permutation order (min 4).
+    let mut hclen = 4;
+    for (k, &slot) in CODE_LENGTH_ORDER.iter().enumerate() {
+        if cl_lens[slot] > 0 {
+            hclen = k + 1;
+        }
+    }
+    let hclen = hclen.max(4).min(19);
+    let mut cl_order_lens = Vec::with_capacity(hclen);
+    for &slot in CODE_LENGTH_ORDER.iter().take(hclen) {
+        cl_order_lens.push(cl_lens[slot]);
+    }
+    // Exact bit cost: header + CL lengths + length stream + token data.
+    let mut bits = 3 + 5 + 5 + 4 + hclen * 3;
+    for &(sym, extra_bits, _) in &runs {
+        bits += cl_lens[sym as usize] as usize + extra_bits as usize;
+    }
+    for i in 0..hlit {
+        bits += lit_freq[i] as usize * lit_lens[i] as usize;
+    }
+    for i in 0..hdist {
+        bits += dist_freq[i] as usize * dist_lens[i] as usize;
+    }
+    Some(DynPlan {
+        lit_rev: reversed_codes(canonical_codes(&lit_lens_padded(&lit_lens))),
+        dist_rev: reversed_codes(canonical_codes(&dist_lens_padded(&dist_lens))),
+        cl_rev: reversed_codes(canonical_codes(&cl_lens_padded(&cl_lens))),
+        hlit,
+        hdist,
+        hclen,
+        runs,
+        cl_order_lens,
+        bits,
+    })
+}
+
+/// Canonical codes need full alphabets; pad truncated length slices.
+fn lit_lens_padded(lit_lens: &[u8]) -> Vec<u8> {
+    let mut v = vec![0u8; 288];
+    v[..lit_lens.len()].copy_from_slice(lit_lens);
+    v
+}
+
+fn dist_lens_padded(dist_lens: &[u8]) -> Vec<u8> {
+    let mut v = vec![0u8; 32];
+    v[..dist_lens.len().min(32)].copy_from_slice(&dist_lens[..dist_lens.len().min(32)]);
+    v
+}
+
+fn cl_lens_padded(cl_lens: &[u8]) -> Vec<u8> {
+    let mut v = vec![0u8; 19];
+    v.copy_from_slice(cl_lens);
+    v
+}
+
+/// Longest match at `pos` (optionally registering its hash for the future).
+fn find_match(
+    data: &[u8],
+    head: &mut [u32],
+    prev: &mut [u32],
+    pos: usize,
+    max_chain: usize,
+    insert: bool,
+) -> (usize, usize) {
+    let n = data.len();
+    let mut best_len = 0usize;
+    let mut best_dist = 0usize;
+    if pos + MIN_MATCH <= n {
+        let h = hash3(data[pos], data[pos + 1], data[pos + 2]);
+        let mut cand = head[h];
+        let max_len = (n - pos).min(MAX_MATCH);
+        let window_start = pos.saturating_sub(WINDOW_SIZE);
+        let mut chain = 0usize;
+        while cand != u32::MAX && chain < max_chain {
+            let c = cand as usize;
+            if c < window_start {
+                break;
+            }
+            // Extend candidate matches 8 bytes at a time.
+            if data[c] == data[pos] {
+                let len = match_len(&data[c..], &data[pos..], max_len);
+                if len >= MIN_MATCH && len > best_len {
+                    best_len = len;
+                    best_dist = pos - c;
+                    if len == MAX_MATCH {
+                        break;
+                    }
+                }
+            }
+            cand = prev[c];
+            chain += 1;
+        }
+        if insert {
+            prev[pos] = head[h];
+            head[h] = pos as u32;
+        }
+    }
+    (best_len, best_dist)
+}
+
+/// One tokenized block plus its symbol frequencies for the cost model.
+struct Block {
+    tokens: Vec<Token>,
+    start: usize,
+    end: usize,
+    lit_freq: [u32; 286],
+    dist_freq: [u32; 30],
+}
+
+/// Matches below this length still try lazy evaluation (Balanced/Best).
+const NICE_LEN: usize = 32;
+
 /// Compress raw bytes into a raw DEFLATE stream.
 pub fn compress_raw(data: &[u8], level: CompressionLevel) -> Vec<u8> {
     if data.is_empty() {
@@ -716,43 +1012,52 @@ pub fn compress_raw(data: &[u8], level: CompressionLevel) -> Vec<u8> {
     let fixed_dist = reversed_codes(canonical_codes(&fixed_dist_lengths()));
 
     let mut pos = 0usize;
-    // Tokens of the current block plus uncompressed byte count.
-    let mut tokens: Vec<Token> = Vec::new();
+    let lazy = matches!(
+        level,
+        CompressionLevel::Balanced | CompressionLevel::Best
+    );
+    let mut cur = Block {
+        tokens: Vec::new(),
+        start: 0,
+        end: 0,
+        lit_freq: [0; 286],
+        dist_freq: [0; 30],
+    };
     let mut block_len = 0usize;
 
-    // Greedy LZ77 pass, cutting blocks at ~BLOCK_TARGET bytes.
-    let mut pending: Vec<(Vec<Token>, usize, usize)> = Vec::new();
-    let mut block_start = 0usize;
+    // LZ77 pass with one-step lazy evaluation, cutting blocks at ~32 KiB.
+    let mut blocks: Vec<Block> = Vec::new();
+    macro_rules! cut_block {
+        () => {
+            cur.lit_freq[256] += 1; // end-of-block marker
+            cur.end = pos;
+            blocks.push(Block {
+                tokens: std::mem::take(&mut cur.tokens),
+                start: cur.start,
+                end: pos,
+                lit_freq: std::mem::replace(&mut cur.lit_freq, [0; 286]),
+                dist_freq: std::mem::replace(&mut cur.dist_freq, [0; 30]),
+            });
+            cur.start = pos;
+            block_len = 0;
+        };
+    }
     while pos < n {
-        let mut best_len = 0usize;
-        let mut best_dist = 0usize;
-        if pos + MIN_MATCH <= n {
-            let h = hash3(data[pos], data[pos + 1], data[pos + 2]);
-            let mut cand = head[h];
-            let mut chain = 0usize;
-            let max_len = (n - pos).min(MAX_MATCH);
-            let window_start = pos.saturating_sub(WINDOW_SIZE);
-            while cand != u32::MAX && chain < max_chain {
-                let c = cand as usize;
-                if c < window_start {
-                    break;
+        let (best_len, best_dist) = find_match(data, &mut head, &mut prev, pos, max_chain, true);
+        // Lazy: a longer match starting one byte later wins over this one.
+        if lazy && best_len >= MIN_MATCH && best_len < NICE_LEN && pos + 1 + MIN_MATCH <= n {
+            let (next_len, _) =
+                find_match(data, &mut head, &mut prev, pos + 1, max_chain, false);
+            if next_len > best_len {
+                cur.tokens.push(Token::Literal(data[pos]));
+                cur.lit_freq[data[pos] as usize] += 1;
+                pos += 1;
+                block_len += 1;
+                if block_len >= BLOCK_TARGET && pos < n {
+                    cut_block!();
                 }
-                // Extend candidate matches 8 bytes at a time.
-                if data[c] == data[pos] {
-                    let len = match_len(&data[c..], &data[pos..], max_len);
-                    if len >= MIN_MATCH && len > best_len {
-                        best_len = len;
-                        best_dist = pos - c;
-                        if len == MAX_MATCH {
-                            break;
-                        }
-                    }
-                }
-                cand = prev[c];
-                chain += 1;
+                continue;
             }
-            prev[pos] = head[h];
-            head[h] = pos as u32;
         }
         if best_len >= MIN_MATCH {
             // Register hashes of the skipped bytes so future matches see them.
@@ -764,36 +1069,57 @@ pub fn compress_raw(data: &[u8], level: CompressionLevel) -> Vec<u8> {
                     head[h] = p as u32;
                 }
             }
-            tokens.push(Token::Match {
+            let (lsym, _, _) = length_symbol(best_len as u16);
+            let (dsym, _, _) = dist_symbol(best_dist as u16);
+            cur.lit_freq[lsym as usize] += 1;
+            cur.dist_freq[dsym as usize] += 1;
+            cur.tokens.push(Token::Match {
                 len: best_len as u16,
                 dist: best_dist as u16,
             });
             pos += best_len;
             block_len += best_len;
         } else {
-            tokens.push(Token::Literal(data[pos]));
+            cur.tokens.push(Token::Literal(data[pos]));
+            cur.lit_freq[data[pos] as usize] += 1;
             pos += 1;
             block_len += 1;
         }
         if block_len >= BLOCK_TARGET && pos < n {
-            pending.push((std::mem::take(&mut tokens), block_start, pos));
-            block_start = pos;
-            block_len = 0;
+            cut_block!();
         }
     }
-    pending.push((tokens, block_start, n));
+    cut_block!();
 
-    let last = pending.len().saturating_sub(1);
-    for (bi, (tokens, start, end)) in pending.into_iter().enumerate() {
+    let last = blocks.len() - 1;
+    for (bi, b) in blocks.into_iter().enumerate() {
         let is_final = bi == last;
-        emit_block(
-            &mut w,
-            &tokens,
-            &data[start..end],
-            is_final,
-            &fixed_codes,
-            &fixed_dist,
-        );
+        let raw = &data[b.start..b.end];
+        // Fixed-Huffman cost.
+        let mut fixed_bits = 3 + 7; // header + end-of-block
+        for t in &b.tokens {
+            fixed_bits += token_fixed_bits(t);
+        }
+        let fixed_bytes = (fixed_bits + 7) / 8;
+        // Stored cost.
+        let stored_bytes = 5 * ((raw.len() + 65_534) / 65_535).max(1) + raw.len();
+        // Dynamic cost (skipped when the block has no matches).
+        let dyn_plan = plan_dynamic(&b.lit_freq, &b.dist_freq);
+        let mut choice = (fixed_bytes, 0u8); // 0 = fixed
+        if let Some(ref plan) = dyn_plan {
+            let dyn_bytes = (plan.bits + 7) / 8;
+            if dyn_bytes < choice.0 {
+                choice = (dyn_bytes, 1);
+            }
+        }
+        if stored_bytes < choice.0 {
+            choice = (stored_bytes, 2);
+        }
+        match choice.1 {
+            0 => emit_fixed(&mut w, &b.tokens, is_final, &fixed_codes, &fixed_dist),
+            1 => emit_dynamic(&mut w, &b.tokens, &dyn_plan.unwrap(), is_final),
+            _ => emit_stored(&mut w, raw, is_final),
+        }
     }
     w.finish()
 }
@@ -836,27 +1162,6 @@ fn token_fixed_bits(tok: &Token) -> usize {
             lit_bits + le as usize + 5 + de as usize
         }
     }
-}
-
-fn emit_block(
-    w: &mut BitWriter,
-    tokens: &[Token],
-    raw: &[u8],
-    is_final: bool,
-    fixed_codes: &[(u32, u8)],
-    fixed_dist: &[(u32, u8)],
-) {
-    // Compare fixed-Huffman cost vs stored cost.
-    let mut fixed_bits = 3 + 7; // header + end-of-block code
-    for t in tokens {
-        fixed_bits += token_fixed_bits(t);
-    }
-    let stored_bytes = 5 * ((raw.len() + 65_534) / 65_535).max(1) + raw.len();
-    if (fixed_bits + 7) / 8 >= stored_bytes {
-        emit_stored(w, raw, is_final);
-        return;
-    }
-    emit_fixed(w, tokens, is_final, fixed_codes, fixed_dist);
 }
 
 /// Emit one or more stored (uncompressed) blocks.
@@ -913,6 +1218,43 @@ fn emit_fixed(
         }
     }
     let (c, l) = fixed_codes[256];
+    w.write_code_rev(c, l);
+}
+
+/// Emit a dynamic-Huffman block from a costed plan.
+fn emit_dynamic(w: &mut BitWriter, tokens: &[Token], plan: &DynPlan, is_final: bool) {
+    w.write_bit(is_final as u32);
+    w.write_bits_le(2, 2); // BTYPE = dynamic
+    w.write_bits_le(plan.hlit as u32 - 257, 5);
+    w.write_bits_le(plan.hdist as u32 - 1, 5);
+    w.write_bits_le(plan.hclen as u32 - 4, 4);
+    for &l in &plan.cl_order_lens {
+        w.write_bits_le(l as u32, 3);
+    }
+    for &(sym, extra_bits, val) in &plan.runs {
+        let (c, l) = plan.cl_rev[sym as usize];
+        w.write_code_rev(c, l);
+        w.write_bits_le(val, extra_bits);
+    }
+    for t in tokens {
+        match *t {
+            Token::Literal(b) => {
+                let (c, l) = plan.lit_rev[b as usize];
+                w.write_code_rev(c, l);
+            }
+            Token::Match { len, dist } => {
+                let (lsym, lval, lextra) = length_symbol(len);
+                let (c, l) = plan.lit_rev[lsym as usize];
+                w.write_code_rev(c, l);
+                w.write_bits_le(lval, lextra);
+                let (dsym, dval, dextra) = dist_symbol(dist);
+                let (c, l) = plan.dist_rev[dsym as usize];
+                w.write_code_rev(c, l);
+                w.write_bits_le(dval, dextra);
+            }
+        }
+    }
+    let (c, l) = plan.lit_rev[256];
     w.write_code_rev(c, l);
 }
 
@@ -1014,5 +1356,32 @@ mod tests {
         ];
         assert!(decompress_raw_limited(&raw, 4).is_err());
         assert!(decompress_raw_limited(&raw, 5).is_ok());
+    }
+
+    #[test]
+    fn external_decoder_compat() {
+        // Whatever block mix the encoder picks (fixed, dynamic, stored),
+        // an independent implementation must decode it.
+        use std::io::Read;
+        let payloads: Vec<Vec<u8>> = vec![
+            b"hello hello hello world world world".to_vec(),
+            (0..50_000u32).map(|i| (i % 251) as u8).collect(),
+            vec![0xABu8; 10_000],
+            b"The quick brown fox jumps over the lazy dog. ".repeat(200),
+        ];
+        for data in &payloads {
+            for level in [
+                CompressionLevel::None,
+                CompressionLevel::Fastest,
+                CompressionLevel::Balanced,
+                CompressionLevel::Best,
+            ] {
+                let enc = compress_raw(data, level);
+                let mut d = flate2::read::DeflateDecoder::new(&enc[..]);
+                let mut out = Vec::new();
+                d.read_to_end(&mut out).unwrap();
+                assert_eq!(&out, data);
+            }
+        }
     }
 }

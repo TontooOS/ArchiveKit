@@ -1,6 +1,6 @@
 # Deflate
 
-Raw DEFLATE codec (RFC 1951). The decoder implements full inflate (stored, fixed-Huffman and dynamic-Huffman blocks); the encoder runs greedy LZ77 over a 32 KiB window and emits fixed-Huffman blocks with a stored-block fallback for incompressible data. Output is valid RFC 1951 and interoperable with system tools.
+Raw DEFLATE codec (RFC 1951). The decoder implements full inflate (stored, fixed-Huffman and dynamic-Huffman blocks); the encoder runs LZ77 over a 32 KiB window with one-step lazy evaluation (Balanced/Best) and emits the cheapest of fixed-Huffman, dynamic-Huffman or stored blocks per ~32 KiB chunk. Output is valid RFC 1951 and interoperable with system tools.
 
 ## Compression Levels
 
@@ -69,9 +69,7 @@ assert_eq!(decompress_raw_limited(&enc, 9).unwrap(), b"abcabcabc");
 
 ## Block Strategy
 
-The encoder cuts the input into ~32 KiB blocks. Each block compares the fixed-Huffman bit cost against the stored cost and emits whichever is smaller, so incompressible data never expands by more than the stored-block framing (5 bytes per 64 KiB).
-
-> **Note:** The encoder emits fixed-Huffman blocks only (plus stored). Dynamic-Huffman blocks are decoded but never written. This is fully spec-compliant.
+The encoder cuts the input into ~32 KiB blocks. Each block compares fixed-Huffman, dynamic-Huffman (optimal-ish lengths via Huffman coding with frequency scaling, run-length encoded) and stored costs, then emits whichever is smallest, so incompressible data never expands by more than the stored-block framing (5 bytes per 64 KiB). Tiny blocks without matches skip the dynamic plan (fixed/stored win by construction).
 
 ## Usage / Example
 

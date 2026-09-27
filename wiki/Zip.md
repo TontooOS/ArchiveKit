@@ -28,7 +28,6 @@ pub struct ZipEntry {
     pub data: Vec<u8>,
 }
 ```
-
 | Field | Type | Description |
 |---|---|---|
 | `name` | `String` | Forward-slash path inside the archive |
@@ -40,6 +39,23 @@ pub struct ZipEntry {
 | `data` | `Vec<u8>` | Decompressed payload (empty for directories) |
 
 Predicates: `is_dir()` (trailing `/`), `is_symlink()` (Unix mode check).
+
+### `ZipIndexEntry`
+
+```rust
+pub struct ZipIndexEntry {
+    pub name: String,
+    pub method: ZipMethod,
+    pub uncompressed_size: u64,
+    pub compressed_size: u64,
+    pub crc32: u32,
+    pub unix_mode: Option<u32>,
+    pub local_offset: u64,
+    pub flags: u16,
+}
+```
+
+Central-directory metadata without payload, returned by `read_index` and consumed by `read_one`. Predicate: `is_dir()`.
 
 ### `ZipWriterOptions`
 
@@ -84,10 +100,13 @@ impl<'a> ZipReader<'a> {
     pub fn new(data: &'a [u8]) -> Self;
     pub fn with_max_output(self, max_output: usize) -> Self;
     pub fn read_all(&self) -> Result<Vec<ZipEntry>>;
+    pub fn read_index(&self) -> Result<Vec<ZipIndexEntry>>;
+    pub fn find_in_index(index: &[ZipIndexEntry], name: &str) -> Option<ZipIndexEntry>;
+    pub fn read_one(&self, index: &ZipIndexEntry) -> Result<ZipEntry>;
 }
 ```
 
-The reader locates the end-of-central-directory (scanning the last 64 KiB + 22 bytes), follows the ZIP64 locator when present, then resolves each entry through its local header. CRC32 is verified per file entry. Returns `Err` on missing EOCD, out-of-bounds directories, encrypted entries (`Unsupported`), unknown methods (`Unsupported`), size mismatches, checksum failures (`ChecksumMismatch`), or output over the limit (default 256 MiB).
+The reader locates the end-of-central-directory (scanning the last 64 KiB + 22 bytes), follows the ZIP64 locator when present, then resolves each entry through its local header. `read_index` parses only the central directory (no payload touched); `read_one` decodes a single entry; `read_all` is index plus per-entry decode. CRC32 is verified per file entry. Returns `Err` on missing EOCD, out-of-bounds directories, encrypted entries (`Unsupported`), unknown methods (`Unsupported`), size mismatches, checksum failures (`ChecksumMismatch`), or output over the limit (default 256 MiB).
 
 > **Note:** Data-descriptor entries (bit 3, local sizes zeroed) are resolved via the central directory. Non-UTF8 names decode lossily and round-trip ASCII exactly.
 

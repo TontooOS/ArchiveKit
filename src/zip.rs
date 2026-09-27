@@ -230,12 +230,19 @@ impl ZipWriter {
         if name_bytes.len() > u16::MAX as usize {
             return Err(unsupported("zip entry names longer than 64 KiB"));
         }
-        let (payload, method) = match method {
-            ZipMethod::Stored => (data.to_vec(), ZipMethod::Stored),
-            ZipMethod::Deflate => (compress_raw(data, self.options.level), ZipMethod::Deflate),
-        };
         let mut crc = Crc32::new();
         crc.update(data);
+        let crc_v = crc.finalize();
+        // Compress first (deflate needs its output size up front); stored
+        // entries are copied straight into the archive, no temp buffer.
+        let compressed: Vec<u8>;
+        let payload: &[u8] = match method {
+            ZipMethod::Stored => data,
+            ZipMethod::Deflate => {
+                compressed = compress_raw(data, self.options.level);
+                &compressed
+            }
+        };
         let need_zip64 = data.len() as u64 > U32_MAX_AS_U64
             || payload.len() as u64 > U32_MAX_AS_U64
             || self.buf.len() as u64 > U32_MAX_AS_U64;
@@ -253,7 +260,7 @@ impl ZipWriter {
         self.buf.extend_from_slice(&FLAG_UTF8.to_le_bytes());
         self.buf.extend_from_slice(&method.code().to_le_bytes());
         self.buf.extend_from_slice(&[0u8; 4]); // time/date: set below
-        let (crc_v, comp_v, uncomp_v) = (crc.finalize(), payload.len(), data.len());
+        let (comp_v, uncomp_v) = (payload.len(), data.len());
         self.buf.extend_from_slice(&crc_v.to_le_bytes());
         if need_zip64 {
             self.buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
@@ -462,6 +469,34 @@ pub struct ZipReader<'a> {
     max_output: usize,
 }
 
+/// Central-directory metadata of one ZIP entry (no payload decoded).
+#[derive(Debug, Clone)]
+pub struct ZipIndexEntry {
+    /// File name inside the archive (forward slashes).
+    pub name: String,
+    /// Compression method.
+    pub method: ZipMethod,
+    /// Uncompressed size in bytes.
+    pub uncompressed_size: u64,
+    /// Compressed size in bytes.
+    pub compressed_size: u64,
+    /// CRC32 of the uncompressed data.
+    pub crc32: u32,
+    /// Unix permission bits when made by a Unix writer, else `None`.
+    pub unix_mode: Option<u32>,
+    /// Offset of the local file header.
+    pub local_offset: u64,
+    /// General-purpose flags of the central entry.
+    pub flags: u16,
+}
+
+impl ZipIndexEntry {
+    /// True when the name ends with `/`.
+    pub fn is_dir(&self) -> bool {
+        self.name.ends_with('/')
+    }
+}
+
 impl<'a> ZipReader<'a> {
     /// Create a reader over the raw archive bytes.
     pub fn new(data: &'a [u8]) -> Self {
@@ -479,6 +514,12 @@ impl<'a> ZipReader<'a> {
 
     /// Read all entries (files and directories).
     pub fn read_all(&self) -> Result<Vec<ZipEntry>> {
+        let index = self.read_index()?;
+        index.into_iter().map(|e| self.read_one(&e)).collect()
+    }
+
+    /// Read only the central directory (no payload touched or decoded).
+    pub fn read_index(&self) -> Result<Vec<ZipIndexEntry>> {
         let (cd_offset, cd_size, count) = self.locate_central_dir()?;
         let mut entries = Vec::with_capacity(count.min(1_000_000));
         let mut pos = cd_offset;
@@ -526,22 +567,40 @@ impl<'a> ZipReader<'a> {
             } else {
                 None
             };
-            let entry = self.read_entry_data(
-                &name,
-                method,
-                flags,
-                crc,
-                comp_size,
-                uncomp_size,
-                local_offset,
-                unix_mode,
-            )?;
             pos += 46 + name_len + extra_len + comment_len;
-            entries.push(entry);
+            entries.push(ZipIndexEntry {
+                name,
+                method,
+                uncompressed_size: uncomp_size,
+                compressed_size: comp_size,
+                crc32: crc,
+                unix_mode,
+                local_offset,
+                flags,
+            });
         }
         // cd_size is advisory; the entry walk above is authoritative.
         let _ = cd_size;
         Ok(entries)
+    }
+
+    /// Find an index entry by name.
+    pub fn find_in_index(index: &[ZipIndexEntry], name: &str) -> Option<ZipIndexEntry> {
+        index.iter().find(|e| e.name == name).cloned()
+    }
+
+    /// Decode a single entry from its index record (only its bytes).
+    pub fn read_one(&self, index: &ZipIndexEntry) -> Result<ZipEntry> {
+        self.read_entry_data(
+            &index.name,
+            index.method,
+            index.flags,
+            index.crc32,
+            index.compressed_size,
+            index.uncompressed_size,
+            index.local_offset,
+            index.unix_mode,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -826,6 +885,24 @@ mod tests {
             zip_unpack(&raw),
             Err(ArchiveError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn index_only_lists_without_decoding() {
+        let files: &[(&str, &[u8])] = &[
+            ("a.txt", b"aaa"),
+            ("sub/b.txt", b"bbb compress me bbb"),
+        ];
+        let raw = zip_pack(files, &opts()).unwrap();
+        let reader = ZipReader::new(&raw);
+        let index = reader.read_index().unwrap();
+        assert_eq!(index.len(), 2);
+        assert_eq!(index[1].name, "sub/b.txt");
+        assert_eq!(index[1].uncompressed_size, 19);
+        // Single entry without decoding the rest.
+        let hit = ZipReader::find_in_index(&index, "sub/b.txt").unwrap();
+        assert_eq!(reader.read_one(&hit).unwrap().data, b"bbb compress me bbb");
+        assert!(ZipReader::find_in_index(&index, "missing").is_none());
     }
 
     #[test]
