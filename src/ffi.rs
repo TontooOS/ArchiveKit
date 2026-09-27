@@ -506,8 +506,7 @@ pub unsafe extern "C" fn archivekit_app_manifest(
 pub unsafe extern "C" fn archivekit_app_extract(
     src: *const c_char,
     dst_dir: *const c_char,
-) -> c_int {
-    clear_error();
+) -> c_int {    clear_error();
     let (Ok(src), Ok(dst)) = (cstr_to_path(src), cstr_to_path(dst_dir)) else {
         return -1;
     };
@@ -560,6 +559,69 @@ pub unsafe extern "C" fn archivekit_app_pack(
         Err(e) => {
             set_error(e.to_string());
             -2
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ZIP files (streaming, constant memory)
+// ---------------------------------------------------------------------------
+
+/// Extract a `.zip` file into a directory with constant memory.
+///
+/// Returns 0 on success, negative on error.
+///
+/// # Safety
+/// `src` and `dst_dir` must be valid NUL-terminated strings.
+#[no_mangle]
+pub unsafe extern "C" fn archivekit_zip_extract(
+    src: *const c_char,
+    dst_dir: *const c_char,
+) -> c_int {
+    clear_error();
+    let (Ok(src), Ok(dst)) = (cstr_to_path(src), cstr_to_path(dst_dir)) else {
+        return -1;
+    };
+    match crate::ZipFileReader::open(&src).and_then(|mut r| r.extract_all_to(&dst)) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(e.to_string());
+            -2
+        }
+    }
+}
+
+/// List entry names of a `.zip` file as newline-separated UTF-8 (free with
+/// `archivekit_free_string`), or NULL on error. Only the tail plus the
+/// central directory are read.
+///
+/// # Safety
+/// `src` must be a valid NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn archivekit_zip_list(src: *const c_char) -> *mut c_char {
+    clear_error();
+    let Ok(path) = cstr_to_path(src) else {
+        return ptr::null_mut();
+    };
+    match crate::ZipFileReader::open(&path) {
+        Ok(r) => {
+            let joined = r
+                .index()
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            match CString::new(joined) {
+                Ok(s) => s.into_raw(),
+                Err(_) => {
+                    set_error("entry names contain NUL".to_string());
+                    ptr::null_mut()
+                }
+            }
+        }
+        Err(e) => {
+            set_error(e.to_string());
+            ptr::null_mut()
         }
     }
 }

@@ -138,6 +138,27 @@ int archivekit_extract(const char *src, const char *dst_dir);
 int archivekit_pack_dir(const char *src_dir, const char *dst, int format, int level);
 
 /* ======================== */
+/* ZIP files (streaming)    */
+/* ======================== */
+
+/**
+ * Extract a .zip file into a directory with constant memory.
+ *
+ * @param src archive file
+ * @param dst_dir destination directory
+ * @return 0 on success, negative on error
+ */
+int archivekit_zip_extract(const char *src, const char *dst_dir);
+
+/**
+ * List entry names of a .zip file (tail + central directory only).
+ *
+ * @param src archive file
+ * @return newline-separated names (free with archivekit_free_string) or NULL
+ */
+char* archivekit_zip_list(const char *src);
+
+/* ======================== */
 /* .app containers          */
 /* ======================== */
 

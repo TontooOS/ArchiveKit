@@ -140,6 +140,58 @@ fn main() -> archivekit::Result<()> {
 }
 ```
 
+## File APIs (constant memory)
+
+`ZipFileReader` opens an archive from disk reading only the tail plus the central directory; entries stream straight to disk with bounded RAM (100 GB archives welcome). `ZipFileWriter` streams local data to disk and buffers only the central directory.
+
+```rust
+use archivekit::{ZipFileReader, ZipFileWriter, ZipMethod};
+use std::path::Path;
+
+fn main() -> archivekit::Result<()> {
+    let mut w = ZipFileWriter::create(Path::new("/tmp/big.zip"))?;
+    w.append_file_from_disk("big.bin", Path::new("/data/big.bin"), ZipMethod::Stored)?;
+    w.finish()?;
+
+    let mut r = ZipFileReader::open(Path::new("/tmp/big.zip"))?;
+    assert_eq!(r.index().len(), 1);
+    r.extract_all_to(Path::new("/tmp/out"))?;
+    Ok(())
+}
+```
+
+### `ZipFileReader`
+
+```rust
+impl ZipFileReader {
+    pub fn open(path: &Path) -> Result<Self>;
+    pub fn len(&self) -> u64;
+    pub fn is_empty(&self) -> bool;
+    pub fn index(&self) -> &[ZipIndexEntry];
+    pub fn extract_entry_to_writer(&mut self, name: &str, out: &mut impl Write) -> Result<u64>;
+    pub fn extract_entry_to_path(&mut self, name: &str, dest: &Path) -> Result<u64>;
+    pub fn extract_all_to(&mut self, dir: &Path) -> Result<()>;
+}
+```
+
+`extract_entry_to_writer` returns payload bytes after CRC verification (`ChecksumMismatch` on corruption, `NotFound` for missing names, `Ok(0)` for directories). `extract_all_to` validates every path before writing, recreates symlinks on Unix (`Unsupported` elsewhere) and restores Unix modes on Unix.
+
+### `ZipFileWriter`
+
+```rust
+impl ZipFileWriter {
+    pub fn create(path: &Path) -> Result<Self>;
+    pub fn create_with_options(path: &Path, options: ZipWriterOptions) -> Result<Self>;
+    pub fn append_dir(&mut self, name: &str) -> Result<()>;
+    pub fn append_file(&mut self, name: &str, data: &[u8]) -> Result<()>;
+    pub fn append_file_with_method(&mut self, name: &str, data: &[u8], method: ZipMethod, unix_mode: u32) -> Result<()>;
+    pub fn append_file_from_disk(&mut self, name: &str, src: &Path, method: ZipMethod) -> Result<()>;
+    pub fn finish(self) -> Result<()>;
+}
+```
+
+`append_file_from_disk` streams Stored entries in 1 MiB chunks (CRC pre-pass plus copy); Deflate entries are read fully first (documented limit).
+
 ## Cross References
 
 - [Deflate.md](Deflate.md) – engine behind Deflate entries

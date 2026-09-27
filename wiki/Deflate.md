@@ -61,6 +61,14 @@ assert!(decompress_raw_limited(&enc, 4).is_err());
 assert_eq!(decompress_raw_limited(&enc, 9).unwrap(), b"abcabcabc");
 ```
 
+### `decompress_stream`
+
+```rust
+pub fn decompress_stream<R: Read>(input: R, output: &mut impl Write, max_output: u64) -> Result<(u64, u64)>
+```
+
+Streaming inflate with bounded memory (128 KiB input buffer, ~8 MiB output chunks plus a 32 KiB match tail). Returns `(bytes_written, bytes_read)`. Used by `ZipFileReader` for huge entries.
+
 ## Constants
 
 | Item | Value | Description |

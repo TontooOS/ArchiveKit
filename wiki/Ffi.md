@@ -232,6 +232,17 @@ int archivekit_app_pack(const char *staging_dir, const char *dst, const char *ap
 | -2 | Operation failed; check `archivekit_last_error` |
 | -3 | (`pack` only) parent directory of `dst` cannot be created |
 
+## ZIP Files (streaming, constant memory)
+
+### `archivekit_zip_extract` / `archivekit_zip_list`
+
+```c
+int archivekit_zip_extract(const char *src, const char *dst_dir);
+char* archivekit_zip_list(const char *src);
+```
+
+`archivekit_zip_extract` returns 0/-1/-2 like above. `archivekit_zip_list` returns newline-separated names (free with `archivekit_free_string`) reading only the tail plus the central directory, or NULL on error.
+
 ## Cross References
 
 - [Combined.md](Combined.md) – Rust counterparts of the file helpers

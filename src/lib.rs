@@ -55,7 +55,7 @@ pub use gzip::{
 };
 pub use tar::{tar_pack, tar_pack_dir, tar_unpack, tar_unpack_to_dir, TarEntry, TarKind, TarReader,
     TarWriteOptions, TarWriter};
-pub use zip::{zip_pack, zip_unpack, ZipEntry, ZipIndexEntry, ZipMethod, ZipReader, ZipWriter, ZipWriterOptions};
+pub use zip::{zip_pack, zip_unpack, ZipEntry, ZipFileReader, ZipFileWriter, ZipIndexEntry, ZipMethod, ZipReader, ZipWriter, ZipWriterOptions};
 
 /// Convenience prelude.
 pub mod prelude {

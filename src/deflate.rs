@@ -6,7 +6,7 @@
 //!   fixed-Huffman blocks with a stored-block fallback for incompressible
 //!   data. Output is valid RFC 1951 and interoperable with system tools.
 
-use crate::error::{invalid, Result};
+use crate::error::{invalid, ArchiveError, Result};
 
 /// Compression effort for [`compress_raw`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -37,84 +37,23 @@ impl CompressionLevel {
 // Bit I/O (LSB-first byte order, Huffman codes packed MSB-first per RFC 1951)
 // ---------------------------------------------------------------------------
 
-struct BitReader<'a> {
-    data: &'a [u8],
-    /// Next unread input byte.
-    pos: usize,
-    /// Buffered bits, consumed from the LSB.
-    bitbuf: u64,
-    /// Valid bits in `bitbuf`.
-    bits: u8,
-}
-
-impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self {
-            data,
-            pos: 0,
-            bitbuf: 0,
-            bits: 0,
-        }
-    }
-
+/// Bit source for inflate: implemented by the slice reader (one-shot) and
+/// the buffered stream reader (constant-memory file decoding).
+trait Bits {
     /// Ensure at least `n` buffered bits (`n <= 16` everywhere below).
-    #[inline]
-    fn ensure(&mut self, n: u8) -> Result<()> {
-        while self.bits < n {
-            if self.pos >= self.data.len() {
-                return Err(invalid("unexpected end of deflate stream"));
-            }
-            self.bitbuf |= (self.data[self.pos] as u64) << self.bits;
-            self.bits += 8;
-            self.pos += 1;
-        }
-        Ok(())
-    }
-
-    #[inline]
-    fn read_bit(&mut self) -> Result<u32> {
-        self.ensure(1)?;
-        let b = (self.bitbuf & 1) as u32;
-        self.bitbuf >>= 1;
-        self.bits -= 1;
-        Ok(b)
-    }
-
-    /// Read `n` bits as a little-endian integer (first bit = LSB).
-    #[inline]
-    fn read_bits_le(&mut self, n: u8) -> Result<u32> {
-        self.ensure(n)?;
-        let v = (self.bitbuf & ((1u64 << n) - 1)) as u32;
-        self.bitbuf >>= n;
-        self.bits -= n;
-        Ok(v)
-    }
-
+    fn ensure(&mut self, n: u8) -> Result<()>;
+    /// Buffered bit count (for the fast-table availability check).
+    fn available(&self) -> u8;
     /// Peek up to 9 bits without failing (zero-padded past input end).
-    #[inline]
-    fn peek9(&mut self) -> u32 {
-        while self.bits < TABLE_BITS && self.pos < self.data.len() {
-            self.bitbuf |= (self.data[self.pos] as u64) << self.bits;
-            self.bits += 8;
-            self.pos += 1;
-        }
-        (self.bitbuf & 0x1FF) as u32
-    }
-
-    #[inline]
-    fn consume(&mut self, n: u8) {
-        debug_assert!(n <= self.bits);
-        self.bitbuf >>= n;
-        self.bits -= n;
-    }
-
+    fn peek9(&mut self) -> u32;
+    /// Drop `n` buffered bits (`n <= available()`).
+    fn consume(&mut self, n: u8);
     /// Read a Huffman symbol via the fast table, slow tree on miss.
-    #[inline]
     fn read_code(&mut self, table: &DecodeTable) -> Result<u16> {
         let peek = self.peek9();
         let (sym, len) = table.fast[peek as usize];
         if sym != TABLE_LONG {
-            if len > self.bits {
+            if len > self.available() {
                 return Err(invalid("unexpected end of deflate stream"));
             }
             self.consume(len);
@@ -122,14 +61,13 @@ impl<'a> BitReader<'a> {
         }
         self.read_code_slow(&table.tree, peek)
     }
-
     /// Tree walk for codes longer than 9 bits (or invalid prefixes).
     fn read_code_slow(&mut self, tree: &DecodeTree, peek: u32) -> Result<u16> {
         // The peeked bits are the next stream bits in order; walk the tree
         // with them first, then keep reading from the stream.
         let mut node = 0usize;
         for k in 0..TABLE_BITS {
-            if k >= self.bits {
+            if k >= self.available() {
                 return Err(invalid("unexpected end of deflate stream"));
             }
             let b = ((peek >> k) & 1) as usize;
@@ -150,18 +88,47 @@ impl<'a> BitReader<'a> {
             }
         }
     }
-
-    fn align_to_byte(&mut self) {
-        let drop = self.bits & 7;
-        self.bitbuf >>= drop;
-        self.bits -= drop;
-    }
-
+    /// Read one bit.
+    fn read_bit(&mut self) -> Result<u32>;
+    /// Read `n` bits as a little-endian integer (first bit = LSB).
+    fn read_bits_le(&mut self, n: u8) -> Result<u32>;
+    /// Drop to the next byte boundary.
+    fn align_to_byte(&mut self);
+    /// Copy the next `n` raw bytes (byte-aligned first) into `out`.
+    fn read_bytes_into(&mut self, n: usize, out: &mut Vec<u8>) -> Result<()>;
+    /// True when no input bits remain.
+    fn is_eof(&mut self) -> bool;
+    /// Input bytes consumed so far, including a partially-read byte.
+    fn consumed(&self) -> u64;
+    /// Little-endian u16 (stored-block framing only, rare path).
     fn read_u16le(&mut self) -> Result<u16> {
-        let b = self.read_bytes(2)?;
-        Ok(u16::from_le_bytes([b[0], b[1]]))
+        let mut tmp = Vec::with_capacity(2);
+        self.read_bytes_into(2, &mut tmp)?;
+        Ok(u16::from_le_bytes([tmp[0], tmp[1]]))
+    }
+}
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    /// Next unread input byte.
+    pos: usize,
+    /// Buffered bits, consumed from the LSB.
+    bitbuf: u64,
+    /// Valid bits in `bitbuf`.
+    bits: u8,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            pos: 0,
+            bitbuf: 0,
+            bits: 0,
+        }
     }
 
+    /// Borrow the next `n` raw bytes (byte-aligned first).
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
         self.align_to_byte();
         // Buffered whole bytes are the input bytes right before `pos`.
@@ -175,14 +142,79 @@ impl<'a> BitReader<'a> {
         self.pos = start + n;
         Ok(&self.data[start..start + n])
     }
+}
 
-    fn is_eof(&self) -> bool {
+impl Bits for BitReader<'_> {
+    #[inline]
+    fn ensure(&mut self, n: u8) -> Result<()> {
+        while self.bits < n {
+            if self.pos >= self.data.len() {
+                return Err(invalid("unexpected end of deflate stream"));
+            }
+            self.bitbuf |= (self.data[self.pos] as u64) << self.bits;
+            self.bits += 8;
+            self.pos += 1;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn available(&self) -> u8 {
+        self.bits
+    }
+
+    #[inline]
+    fn peek9(&mut self) -> u32 {
+        while self.bits < TABLE_BITS && self.pos < self.data.len() {
+            self.bitbuf |= (self.data[self.pos] as u64) << self.bits;
+            self.bits += 8;
+            self.pos += 1;
+        }
+        (self.bitbuf & 0x1FF) as u32
+    }
+
+    #[inline]
+    fn consume(&mut self, n: u8) {
+        debug_assert!(n <= self.bits);
+        self.bitbuf >>= n;
+        self.bits -= n;
+    }
+
+    #[inline]
+    fn read_bit(&mut self) -> Result<u32> {
+        self.ensure(1)?;
+        let b = (self.bitbuf & 1) as u32;
+        self.bitbuf >>= 1;
+        self.bits -= 1;
+        Ok(b)
+    }
+
+    #[inline]
+    fn read_bits_le(&mut self, n: u8) -> Result<u32> {
+        self.ensure(n)?;
+        let v = (self.bitbuf & ((1u64 << n) - 1)) as u32;
+        self.bitbuf >>= n;
+        self.bits -= n;
+        Ok(v)
+    }
+
+    fn align_to_byte(&mut self) {
+        let drop = self.bits & 7;
+        self.bitbuf >>= drop;
+        self.bits -= drop;
+    }
+
+    fn read_bytes_into(&mut self, n: usize, out: &mut Vec<u8>) -> Result<()> {
+        out.extend_from_slice(self.read_bytes(n)?);
+        Ok(())
+    }
+
+    fn is_eof(&mut self) -> bool {
         (self.pos as u64) * 8 - self.bits as u64 >= (self.data.len() as u64) * 8
     }
 
-    /// Input bytes consumed so far, including a partially-read byte.
-    fn consumed(&self) -> usize {
-        (((self.pos as u64) * 8 - self.bits as u64) + 7) as usize / 8
+    fn consumed(&self) -> u64 {
+        ((self.pos as u64) * 8 - self.bits as u64 + 7) / 8
     }
 }
 
@@ -513,11 +545,246 @@ pub(crate) fn decompress_raw_with_consumed(
             _ => return Err(invalid("reserved deflate block type")),
         }
     }
-    Ok((out, r.consumed()))
+    Ok((out, r.consumed() as usize))
 }
 
-fn decode_huffman_block(
-    r: &mut BitReader,
+// ---------------------------------------------------------------------------
+// Streaming inflate (constant memory, for huge entries)
+// ---------------------------------------------------------------------------
+
+/// Input buffer for streaming inflate (128 KiB, refilled from `Read`).
+const STREAM_BUF: usize = 128 * 1024;
+/// Output is flushed to the writer past this threshold...
+const STREAM_FLUSH: usize = 8 * 1024 * 1024;
+/// ...while retaining the 32 KiB match window across flushes.
+const STREAM_TAIL: usize = 32 * 1024;
+
+/// Buffered bit source over a `Read` stream.
+struct StreamBits<R> {
+    inner: R,
+    buf: Vec<u8>,
+    /// Cursor into `buf`.
+    pos: usize,
+    /// Valid bytes in `buf`.
+    filled: usize,
+    bitbuf: u64,
+    bits: u8,
+    /// Total bytes pulled from `inner`.
+    pulled: u64,
+    eof: bool,
+}
+
+impl<R: std::io::Read> StreamBits<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            buf: vec![0u8; STREAM_BUF],
+            pos: 0,
+            filled: 0,
+            bitbuf: 0,
+            bits: 0,
+            pulled: 0,
+            eof: false,
+        }
+    }
+
+    /// Compact remaining bytes to the front and refill from `inner`.
+    /// Returns false at end of stream.
+    fn refill_buffer(&mut self) -> Result<bool> {
+        if self.pos < self.filled {
+            self.buf.copy_within(self.pos..self.filled, 0);
+            self.filled -= self.pos;
+            self.pos = 0;
+        } else {
+            self.pos = 0;
+            self.filled = 0;
+        }
+        match self.inner.read(&mut self.buf[self.filled..]) {
+            Ok(0) => {
+                self.eof = true;
+                Ok(false)
+            }
+            Ok(n) => {
+                self.filled += n;
+                self.pulled += n as u64;
+                Ok(true)
+            }
+            Err(e) => Err(ArchiveError::Io(e.to_string())),
+        }
+    }
+}
+
+impl<R: std::io::Read> Bits for StreamBits<R> {
+    fn ensure(&mut self, n: u8) -> Result<()> {
+        while self.bits < n {
+            if self.pos >= self.filled && !self.refill_buffer()? {
+                return Err(invalid("unexpected end of deflate stream"));
+            }
+            self.bitbuf |= (self.buf[self.pos] as u64) << self.bits;
+            self.bits += 8;
+            self.pos += 1;
+        }
+        Ok(())
+    }
+
+    fn available(&self) -> u8 {
+        self.bits
+    }
+
+    fn peek9(&mut self) -> u32 {
+        while self.bits < TABLE_BITS {
+            if self.pos >= self.filled {
+                // Errors surface later when bits are actually required.
+                if self.refill_buffer().unwrap_or(false) {
+                    continue;
+                }
+                break;
+            }
+            self.bitbuf |= (self.buf[self.pos] as u64) << self.bits;
+            self.bits += 8;
+            self.pos += 1;
+        }
+        (self.bitbuf & 0x1FF) as u32
+    }
+
+    #[inline]
+    fn consume(&mut self, n: u8) {
+        debug_assert!(n <= self.bits);
+        self.bitbuf >>= n;
+        self.bits -= n;
+    }
+
+    #[inline]
+    fn read_bit(&mut self) -> Result<u32> {
+        self.ensure(1)?;
+        let b = (self.bitbuf & 1) as u32;
+        self.bitbuf >>= 1;
+        self.bits -= 1;
+        Ok(b)
+    }
+
+    #[inline]
+    fn read_bits_le(&mut self, n: u8) -> Result<u32> {
+        self.ensure(n)?;
+        let v = (self.bitbuf & ((1u64 << n) - 1)) as u32;
+        self.bitbuf >>= n;
+        self.bits -= n;
+        Ok(v)
+    }
+
+    fn align_to_byte(&mut self) {
+        let drop = self.bits & 7;
+        self.bitbuf >>= drop;
+        self.bits -= drop;
+    }
+
+    fn read_bytes_into(&mut self, n: usize, out: &mut Vec<u8>) -> Result<()> {
+        self.align_to_byte();
+        let mut remaining = n;
+        // Buffered whole bytes live right before `pos`.
+        let buffered = (self.bits / 8) as usize;
+        let start = self.pos - buffered;
+        let take = buffered.min(remaining);
+        out.extend_from_slice(&self.buf[start..start + take]);
+        // Drop all buffered bits; `pos` already points past them.
+        self.bitbuf = 0;
+        self.bits = 0;
+        remaining -= take;
+        while remaining > 0 {
+            if self.pos >= self.filled && !self.refill_buffer()? {
+                return Err(invalid("unexpected end of deflate stream"));
+            }
+            let take = (self.filled - self.pos).min(remaining);
+            out.extend_from_slice(&self.buf[self.pos..self.pos + take]);
+            self.pos += take;
+            remaining -= take;
+        }
+        Ok(())
+    }
+
+    fn is_eof(&mut self) -> bool {
+        self.eof && self.pos >= self.filled && self.bits == 0
+    }
+
+    fn consumed(&self) -> u64 {
+        let buffered = (self.filled - self.pos) as u64 + self.bits as u64 / 8;
+        self.pulled.saturating_sub(buffered)
+    }
+}
+
+/// Decompress a raw DEFLATE stream from `input` into `output`.
+///
+/// Memory stays bounded (128 KiB input buffer, ~8 MiB output chunks plus a
+/// 32 KiB match tail) regardless of stream size. Returns
+/// `(bytes_written, bytes_read)`.
+pub fn decompress_stream<R: std::io::Read>(
+    input: R,
+    output: &mut impl std::io::Write,
+    max_output: u64,
+) -> Result<(u64, u64)> {
+    let mut r = StreamBits::new(input);
+    let mut out: Vec<u8> = Vec::new();
+    let mut written: u64 = 0;
+    let mut final_block = false;
+
+    // Flush everything but the match tail so distances stay resolvable.
+    let mut flush = |out: &mut Vec<u8>, written: &mut u64, keep_tail: bool| -> Result<()> {
+        let keep = if keep_tail { STREAM_TAIL.min(out.len()) } else { 0 };
+        let n = out.len() - keep;
+        if n > 0 {
+            output.write_all(&out[..n]).map_err(ArchiveError::from)?;
+            *written += n as u64;
+            out.drain(..n);
+        }
+        Ok(())
+    };
+
+    while !final_block {
+        if r.is_eof() {
+            return Err(invalid("truncated deflate stream"));
+        }
+        final_block = r.read_bit()? == 1;
+        let btype = r.read_bits_le(2)?;
+        match btype {
+            0 => {
+                let len = r.read_u16le()?;
+                let nlen = r.read_u16le()?;
+                if len ^ 0xFFFF != nlen {
+                    return Err(invalid("bad stored block lengths"));
+                }
+                if written + out.len() as u64 + len as u64 > max_output {
+                    return Err(invalid("deflate output exceeds limit"));
+                }
+                r.read_bytes_into(len as usize, &mut out)?;
+            }
+            1 => {
+                decode_huffman_block(
+                    &mut r,
+                    &mut out,
+                    fixed_lit_table(),
+                    fixed_dist_table(),
+                    usize::MAX,
+                )?;
+            }
+            2 => {
+                let (lit, dist) = read_dynamic_tables(&mut r)?;
+                decode_huffman_block(&mut r, &mut out, &lit, &dist, usize::MAX)?;
+            }
+            _ => return Err(invalid("reserved deflate block type")),
+        }
+        if written + out.len() as u64 > max_output {
+            return Err(invalid("deflate output exceeds limit"));
+        }
+        if out.len() >= STREAM_FLUSH {
+            flush(&mut out, &mut written, true)?;
+        }
+    }
+    flush(&mut out, &mut written, false)?;
+    Ok((written, r.consumed()))
+}
+
+fn decode_huffman_block<B: Bits>(
+    r: &mut B,
     out: &mut Vec<u8>,
     lit: &DecodeTable,
     dist: &DecodeTable,
@@ -576,7 +843,7 @@ const CODE_LENGTH_ORDER: [usize; 19] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 ];
 
-fn read_dynamic_tables(r: &mut BitReader) -> Result<(DecodeTable, DecodeTable)> {
+fn read_dynamic_tables<B: Bits>(r: &mut B) -> Result<(DecodeTable, DecodeTable)> {
     let hlit = r.read_bits_le(5)? as usize + 257;
     let hdist = r.read_bits_le(5)? as usize + 1;
     let hclen = r.read_bits_le(4)? as usize + 4;
@@ -593,7 +860,7 @@ fn read_dynamic_tables(r: &mut BitReader) -> Result<(DecodeTable, DecodeTable)> 
     let mut i = 0;
     let mut prev = 0u8;
     while i < total {
-        let sym = BitReader::read_code(r, &cl_table)?;
+        let sym = r.read_code(&cl_table)?;
         match sym {
             0..=15 => {
                 lengths[i] = sym as u8;
@@ -1039,7 +1306,6 @@ pub fn compress_raw(data: &[u8], level: CompressionLevel) -> Vec<u8> {
                 dist_freq: std::mem::replace(&mut cur.dist_freq, [0; 30]),
             });
             cur.start = pos;
-            block_len = 0;
         };
     }
     while pos < n {
@@ -1055,6 +1321,7 @@ pub fn compress_raw(data: &[u8], level: CompressionLevel) -> Vec<u8> {
                 block_len += 1;
                 if block_len >= BLOCK_TARGET && pos < n {
                     cut_block!();
+                    block_len = 0;
                 }
                 continue;
             }
@@ -1087,6 +1354,7 @@ pub fn compress_raw(data: &[u8], level: CompressionLevel) -> Vec<u8> {
         }
         if block_len >= BLOCK_TARGET && pos < n {
             cut_block!();
+            block_len = 0;
         }
     }
     cut_block!();
@@ -1359,8 +1627,53 @@ mod tests {
     }
 
     #[test]
-    fn external_decoder_compat() {
-        // Whatever block mix the encoder picks (fixed, dynamic, stored),
+    fn streaming_matches_oneshot() {
+        use std::io::{Cursor, Read};
+        /// Yields at most `chunk` bytes per read to hammer refill edges.
+        struct Chunked<'a> {
+            inner: Cursor<&'a [u8]>,
+            chunk: usize,
+        }
+        impl Read for Chunked<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = buf.len().min(self.chunk);
+                self.inner.read(&mut buf[..n])
+            }
+        }
+        let payloads: Vec<Vec<u8>> = vec![
+            b"hello streaming world, hello again".to_vec(),
+            (0..300_000u32).map(|i| (i % 251) as u8).collect(),
+            vec![0x5Au8; 100_000],
+        ];
+        for data in &payloads {
+            for level in [
+                CompressionLevel::None,
+                CompressionLevel::Fastest,
+                CompressionLevel::Balanced,
+                CompressionLevel::Best,
+            ] {
+                let enc = compress_raw(data, level);
+                for chunk in [1usize, 7, 64, 4096, 1 << 20] {
+                    let mut out = Vec::new();
+                    let (written, read) = super::decompress_stream(
+                        Chunked {
+                            inner: Cursor::new(enc.as_slice()),
+                            chunk,
+                        },
+                        &mut out,
+                        super::DEFAULT_MAX_OUTPUT as u64,
+                    )
+                    .unwrap();
+                    assert_eq!(&out, data);
+                    assert_eq!(written as usize, data.len());
+                    assert_eq!(read as usize, enc.len());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn external_decoder_compat() {        // Whatever block mix the encoder picks (fixed, dynamic, stored),
         // an independent implementation must decode it.
         use std::io::Read;
         let payloads: Vec<Vec<u8>> = vec![

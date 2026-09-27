@@ -8,6 +8,9 @@
 use crate::crc::Crc32;
 use crate::deflate::{compress_raw, decompress_raw_limited, CompressionLevel, DEFAULT_MAX_OUTPUT};
 use crate::error::{invalid, unsupported, ArchiveError, Result};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Component, Path};
 
 const SIG_LOCAL: u32 = 0x0403_4B50;
 const SIG_CENTRAL: u32 = 0x0201_4B50;
@@ -176,6 +179,81 @@ struct CentralRecord {
     is_dir: bool,
 }
 
+/// Validate an entry name (shared by both writers).
+fn check_entry_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(invalid("empty zip entry name"));
+    }
+    if name.starts_with('/') {
+        return Err(ArchiveError::UnsafePath(name.to_string()));
+    }
+    if name.as_bytes().len() > u16::MAX as usize {
+        return Err(unsupported("zip entry names longer than 64 KiB"));
+    }
+    Ok(())
+}
+
+/// Render a local file header (without payload).
+fn render_local(
+    name_bytes: &[u8],
+    method: ZipMethod,
+    crc: u32,
+    comp_size: u64,
+    uncomp_size: u64,
+    local_offset: u64,
+) -> Vec<u8> {
+    let need_zip64 = uncomp_size > U32_MAX_AS_U64
+        || comp_size > U32_MAX_AS_U64
+        || local_offset > U32_MAX_AS_U64;
+    let mut out = Vec::with_capacity(30 + name_bytes.len() + 20);
+    out.extend_from_slice(&SIG_LOCAL.to_le_bytes());
+    out.extend_from_slice(
+        &(if need_zip64 {
+            VERSION_NEEDED_ZIP64
+        } else {
+            VERSION_NEEDED
+        })
+        .to_le_bytes(),
+    );
+    out.extend_from_slice(&FLAG_UTF8.to_le_bytes());
+    out.extend_from_slice(&method.code().to_le_bytes());
+    out.extend_from_slice(&[0u8; 4]); // time/date
+    out.extend_from_slice(&crc.to_le_bytes());
+    if need_zip64 {
+        out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    } else {
+        out.extend_from_slice(&(comp_size as u32).to_le_bytes());
+        out.extend_from_slice(&(uncomp_size as u32).to_le_bytes());
+    }
+    let mut extra = Vec::new();
+    if need_zip64 {
+        extra.extend_from_slice(&ZIP64_EXTRA_ID.to_le_bytes());
+        extra.extend_from_slice(&16u16.to_le_bytes());
+        extra.extend_from_slice(&uncomp_size.to_le_bytes());
+        extra.extend_from_slice(&comp_size.to_le_bytes());
+    }
+    out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+    out.extend_from_slice(name_bytes);
+    out.extend_from_slice(&extra);
+    out
+}
+
+/// Render a directory local header (stored, empty).
+fn render_local_dir(name_bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(30 + name_bytes.len());
+    out.extend_from_slice(&SIG_LOCAL.to_le_bytes());
+    out.extend_from_slice(&VERSION_NEEDED.to_le_bytes());
+    out.extend_from_slice(&FLAG_UTF8.to_le_bytes());
+    out.extend_from_slice(&METHOD_STORED.to_le_bytes());
+    out.extend_from_slice(&[0u8; 16]); // time/date/crc/sizes
+    out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(name_bytes);
+    out
+}
+
 /// Sequential ZIP writer accumulating an in-memory archive.
 #[derive(Debug)]
 pub struct ZipWriter {
@@ -220,16 +298,8 @@ impl ZipWriter {
         method: ZipMethod,
         unix_mode: u32,
     ) -> Result<()> {
-        if name.is_empty() {
-            return Err(invalid("empty zip entry name"));
-        }
-        if name.starts_with('/') {
-            return Err(ArchiveError::UnsafePath(name.to_string()));
-        }
+        check_entry_name(name)?;
         let name_bytes = name.as_bytes();
-        if name_bytes.len() > u16::MAX as usize {
-            return Err(unsupported("zip entry names longer than 64 KiB"));
-        }
         let mut crc = Crc32::new();
         crc.update(data);
         let crc_v = crc.finalize();
@@ -243,53 +313,23 @@ impl ZipWriter {
                 &compressed
             }
         };
-        let need_zip64 = data.len() as u64 > U32_MAX_AS_U64
-            || payload.len() as u64 > U32_MAX_AS_U64
-            || self.buf.len() as u64 > U32_MAX_AS_U64;
-
         let local_offset = self.buf.len() as u64;
-        // Local file header.
-        self.buf.extend_from_slice(&SIG_LOCAL.to_le_bytes());
-        self.buf
-            .extend_from_slice(&(if need_zip64 {
-                VERSION_NEEDED_ZIP64
-            } else {
-                VERSION_NEEDED
-            })
-            .to_le_bytes());
-        self.buf.extend_from_slice(&FLAG_UTF8.to_le_bytes());
-        self.buf.extend_from_slice(&method.code().to_le_bytes());
-        self.buf.extend_from_slice(&[0u8; 4]); // time/date: set below
-        let (comp_v, uncomp_v) = (payload.len(), data.len());
-        self.buf.extend_from_slice(&crc_v.to_le_bytes());
-        if need_zip64 {
-            self.buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-            self.buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-        } else {
-            self.buf.extend_from_slice(&(comp_v as u32).to_le_bytes());
-            self.buf.extend_from_slice(&(uncomp_v as u32).to_le_bytes());
-        }
-        let mut extra = Vec::new();
-        if need_zip64 {
-            extra.extend_from_slice(&ZIP64_EXTRA_ID.to_le_bytes());
-            extra.extend_from_slice(&16u16.to_le_bytes());
-            extra.extend_from_slice(&(uncomp_v as u64).to_le_bytes());
-            extra.extend_from_slice(&(comp_v as u64).to_le_bytes());
-        }
-        self.buf
-            .extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
-        self.buf
-            .extend_from_slice(&(extra.len() as u16).to_le_bytes());
-        self.buf.extend_from_slice(name_bytes);
-        self.buf.extend_from_slice(&extra);
-        self.buf.extend_from_slice(&payload);
+        self.buf.extend_from_slice(&render_local(
+            name_bytes,
+            method,
+            crc_v,
+            payload.len() as u64,
+            data.len() as u64,
+            self.buf.len() as u64,
+        ));
+        self.buf.extend_from_slice(payload);
 
         self.central.push(CentralRecord {
             name: name_bytes.to_vec(),
             method,
             crc: crc_v,
-            comp_size: comp_v as u64,
-            uncomp_size: uncomp_v as u64,
+            comp_size: payload.len() as u64,
+            uncomp_size: data.len() as u64,
             local_offset,
             unix_mode,
             is_dir: false,
@@ -307,15 +347,7 @@ impl ZipWriter {
             return Err(ArchiveError::UnsafePath(n));
         }
         let local_offset = self.buf.len() as u64;
-        self.buf.extend_from_slice(&SIG_LOCAL.to_le_bytes());
-        self.buf.extend_from_slice(&VERSION_NEEDED.to_le_bytes());
-        self.buf.extend_from_slice(&FLAG_UTF8.to_le_bytes());
-        self.buf.extend_from_slice(&METHOD_STORED.to_le_bytes());
-        self.buf.extend_from_slice(&[0u8; 16]); // time/date/crc/sizes
-        self.buf
-            .extend_from_slice(&(n.len() as u16).to_le_bytes());
-        self.buf.extend_from_slice(&0u16.to_le_bytes());
-        self.buf.extend_from_slice(n.as_bytes());
+        self.buf.extend_from_slice(&render_local_dir(n.as_bytes()));
         self.central.push(CentralRecord {
             name: n.into_bytes(),
             method: ZipMethod::Stored,
@@ -332,125 +364,122 @@ impl ZipWriter {
     /// Finish the archive and return its bytes.
     pub fn finish(mut self) -> Vec<u8> {
         let cd_offset = self.buf.len() as u64;
-        let mut cd_size = 0u64;
-        for rec in &self.central {
-            let need_zip64 = rec.comp_size > U32_MAX_AS_U64
-                || rec.uncomp_size > U32_MAX_AS_U64
-                || rec.local_offset > U32_MAX_AS_U64;
-            let mut extra = Vec::new();
-            if need_zip64 {
-                extra.extend_from_slice(&ZIP64_EXTRA_ID.to_le_bytes());
-                let mut body = Vec::new();
-                body.extend_from_slice(&rec.uncomp_size.to_le_bytes());
-                body.extend_from_slice(&rec.comp_size.to_le_bytes());
-                body.extend_from_slice(&rec.local_offset.to_le_bytes());
-                extra.extend_from_slice(&(body.len() as u16).to_le_bytes());
-                extra.extend_from_slice(&body);
-            }
-            let start = self.buf.len();
-            self.buf.extend_from_slice(&SIG_CENTRAL.to_le_bytes());
-            self.buf
-                .extend_from_slice(&MADE_BY_UNIX.to_le_bytes());
-            self.buf.extend_from_slice(
-                &(if need_zip64 {
-                    VERSION_NEEDED_ZIP64
-                } else {
-                    VERSION_NEEDED
-                })
-                .to_le_bytes(),
-            );
-            self.buf.extend_from_slice(&FLAG_UTF8.to_le_bytes());
-            self.buf.extend_from_slice(&rec.method.code().to_le_bytes());
-            self.buf.extend_from_slice(&[0u8; 4]); // time/date
-            self.buf.extend_from_slice(&rec.crc.to_le_bytes());
-            if need_zip64 {
-                self.buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-                self.buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-            } else {
-                self.buf
-                    .extend_from_slice(&(rec.comp_size as u32).to_le_bytes());
-                self.buf
-                    .extend_from_slice(&(rec.uncomp_size as u32).to_le_bytes());
-            }
-            self.buf
-                .extend_from_slice(&(rec.name.len() as u16).to_le_bytes());
-            self.buf
-                .extend_from_slice(&(extra.len() as u16).to_le_bytes());
-            self.buf.extend_from_slice(&0u16.to_le_bytes()); // comment len
-            self.buf.extend_from_slice(&0u16.to_le_bytes()); // disk
-            self.buf.extend_from_slice(&0u16.to_le_bytes()); // int attr
-            let ext_attr = if rec.is_dir {
-                rec.unix_mode
-            } else {
-                (rec.unix_mode & 0xFFFF) << 16
-            };
-            self.buf.extend_from_slice(&ext_attr.to_le_bytes());
-            if need_zip64 {
-                self.buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-            } else {
-                self.buf
-                    .extend_from_slice(&(rec.local_offset as u32).to_le_bytes());
-            }
-            self.buf.extend_from_slice(&rec.name);
-            self.buf.extend_from_slice(&extra);
-            cd_size += (self.buf.len() - start) as u64;
-        }
-        let cd_end = self.buf.len() as u64;
-        let count = self.central.len() as u64;
-        let need_zip64 =
-            count > 0xFFFF || cd_size > U32_MAX_AS_U64 || cd_offset > U32_MAX_AS_U64;
-        let comment = self.options.comment.as_bytes();
-        if need_zip64 {
-            let eocd64_offset = self.buf.len() as u64;
-            self.buf.extend_from_slice(&SIG_EOCD64.to_le_bytes());
-            self.buf.extend_from_slice(&44u64.to_le_bytes()); // size of remainder
-            self.buf.extend_from_slice(&MADE_BY_UNIX.to_le_bytes());
-            self.buf
-                .extend_from_slice(&VERSION_NEEDED_ZIP64.to_le_bytes());
-            self.buf.extend_from_slice(&0u32.to_le_bytes()); // disk
-            self.buf.extend_from_slice(&0u32.to_le_bytes()); // cd disk
-            self.buf.extend_from_slice(&count.to_le_bytes());
-            self.buf.extend_from_slice(&count.to_le_bytes());
-            self.buf.extend_from_slice(&cd_size.to_le_bytes());
-            self.buf.extend_from_slice(&cd_offset.to_le_bytes());
-            self.buf.extend_from_slice(&SIG_LOCATOR64.to_le_bytes());
-            self.buf.extend_from_slice(&0u32.to_le_bytes()); // cd disk
-            self.buf
-                .extend_from_slice(&eocd64_offset.to_le_bytes());
-            self.buf.extend_from_slice(&1u32.to_le_bytes()); // disks
-        }
-        self.buf.extend_from_slice(&SIG_EOCD.to_le_bytes());
-        self.buf.extend_from_slice(&0u16.to_le_bytes());
-        self.buf.extend_from_slice(&0u16.to_le_bytes());
-        self.buf.extend_from_slice(
-            &(if count > 0xFFFF { 0xFFFF } else { count as u16 }).to_le_bytes(),
-        );
-        self.buf.extend_from_slice(
-            &(if count > 0xFFFF { 0xFFFF } else { count as u16 }).to_le_bytes(),
-        );
-        self.buf.extend_from_slice(
-            &(if cd_size > U32_MAX_AS_U64 {
-                0xFFFF_FFFF
-            } else {
-                cd_size as u32
-            })
-            .to_le_bytes(),
-        );
-        self.buf.extend_from_slice(
-            &(if cd_offset > U32_MAX_AS_U64 {
-                0xFFFF_FFFF
-            } else {
-                cd_offset as u32
-            })
-            .to_le_bytes(),
-        );
-        self.buf
-            .extend_from_slice(&(comment.len().min(0xFFFF) as u16).to_le_bytes());
-        self.buf
-            .extend_from_slice(&comment[..comment.len().min(0xFFFF)]);
-        let _ = cd_end;
+        let tail = render_central(&self.central, &self.options.comment, cd_offset);
+        self.buf.extend_from_slice(&tail);
         self.buf
     }
+}
+
+/// Render central directory + EOCD(/ZIP64) for `central` starting at file
+/// offset `cd_offset`. Shared by the in-memory and file writers.
+fn render_central(central: &[CentralRecord], comment: &str, cd_offset: u64) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut cd_size = 0u64;
+    for rec in central {
+        let need_zip64 = rec.comp_size > U32_MAX_AS_U64
+            || rec.uncomp_size > U32_MAX_AS_U64
+            || rec.local_offset > U32_MAX_AS_U64;
+        let mut extra = Vec::new();
+        if need_zip64 {
+            extra.extend_from_slice(&ZIP64_EXTRA_ID.to_le_bytes());
+            let mut body = Vec::new();
+            body.extend_from_slice(&rec.uncomp_size.to_le_bytes());
+            body.extend_from_slice(&rec.comp_size.to_le_bytes());
+            body.extend_from_slice(&rec.local_offset.to_le_bytes());
+            extra.extend_from_slice(&(body.len() as u16).to_le_bytes());
+            extra.extend_from_slice(&body);
+        }
+        let start = buf.len();
+        buf.extend_from_slice(&SIG_CENTRAL.to_le_bytes());
+        buf.extend_from_slice(&MADE_BY_UNIX.to_le_bytes());
+        buf.extend_from_slice(
+            &(if need_zip64 {
+                VERSION_NEEDED_ZIP64
+            } else {
+                VERSION_NEEDED
+            })
+            .to_le_bytes(),
+        );
+        buf.extend_from_slice(&FLAG_UTF8.to_le_bytes());
+        buf.extend_from_slice(&rec.method.code().to_le_bytes());
+        buf.extend_from_slice(&[0u8; 4]); // time/date
+        buf.extend_from_slice(&rec.crc.to_le_bytes());
+        if need_zip64 {
+            buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+            buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        } else {
+            buf.extend_from_slice(&(rec.comp_size as u32).to_le_bytes());
+            buf.extend_from_slice(&(rec.uncomp_size as u32).to_le_bytes());
+        }
+        buf.extend_from_slice(&(rec.name.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        buf.extend_from_slice(&0u16.to_le_bytes()); // disk
+        buf.extend_from_slice(&0u16.to_le_bytes()); // int attr
+        let ext_attr = if rec.is_dir {
+            rec.unix_mode
+        } else {
+            (rec.unix_mode & 0xFFFF) << 16
+        };
+        buf.extend_from_slice(&ext_attr.to_le_bytes());
+        if need_zip64 {
+            buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        } else {
+            buf.extend_from_slice(&(rec.local_offset as u32).to_le_bytes());
+        }
+        buf.extend_from_slice(&rec.name);
+        buf.extend_from_slice(&extra);
+        cd_size += (buf.len() - start) as u64;
+    }
+    let count = central.len() as u64;
+    let need_zip64 =
+        count > 0xFFFF || cd_size > U32_MAX_AS_U64 || cd_offset > U32_MAX_AS_U64;
+    let comment = comment.as_bytes();
+    if need_zip64 {
+        let eocd64_offset = cd_offset + cd_size;
+        buf.extend_from_slice(&SIG_EOCD64.to_le_bytes());
+        buf.extend_from_slice(&44u64.to_le_bytes()); // size of remainder
+        buf.extend_from_slice(&MADE_BY_UNIX.to_le_bytes());
+        buf.extend_from_slice(&VERSION_NEEDED_ZIP64.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // disk
+        buf.extend_from_slice(&0u32.to_le_bytes()); // cd disk
+        buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend_from_slice(&cd_size.to_le_bytes());
+        buf.extend_from_slice(&cd_offset.to_le_bytes());
+        buf.extend_from_slice(&SIG_LOCATOR64.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // cd disk
+        buf.extend_from_slice(&eocd64_offset.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // disks
+    }
+    buf.extend_from_slice(&SIG_EOCD.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(
+        &(if count > 0xFFFF { 0xFFFF } else { count as u16 }).to_le_bytes(),
+    );
+    buf.extend_from_slice(
+        &(if count > 0xFFFF { 0xFFFF } else { count as u16 }).to_le_bytes(),
+    );
+    buf.extend_from_slice(
+        &(if cd_size > U32_MAX_AS_U64 {
+            0xFFFF_FFFF
+        } else {
+            cd_size as u32
+        })
+        .to_le_bytes(),
+    );
+    buf.extend_from_slice(
+        &(if cd_offset > U32_MAX_AS_U64 {
+            0xFFFF_FFFF
+        } else {
+            cd_offset as u32
+        })
+        .to_le_bytes(),
+    );
+    buf.extend_from_slice(&(comment.len().min(0xFFFF) as u16).to_le_bytes());
+    buf.extend_from_slice(&comment[..comment.len().min(0xFFFF)]);
+    buf
 }
 
 impl Default for ZipWriter {
@@ -520,68 +549,8 @@ impl<'a> ZipReader<'a> {
 
     /// Read only the central directory (no payload touched or decoded).
     pub fn read_index(&self) -> Result<Vec<ZipIndexEntry>> {
-        let (cd_offset, cd_size, count) = self.locate_central_dir()?;
-        let mut entries = Vec::with_capacity(count.min(1_000_000));
-        let mut pos = cd_offset;
-        for _ in 0..count {
-            if pos + 46 > self.data.len() {
-                return Err(invalid("truncated zip central directory"));
-            }
-            if u32le(self.data, pos)? != SIG_CENTRAL {
-                return Err(invalid("bad zip central directory signature"));
-            }
-            let flags = u16le(self.data, pos + 8)?;
-            let method = ZipMethod::from_code(u16le(self.data, pos + 10)?)?;
-            let crc = u32le(self.data, pos + 16)?;
-            let mut comp_size = u32le(self.data, pos + 20)? as u64;
-            let mut uncomp_size = u32le(self.data, pos + 24)? as u64;
-            let name_len = u16le(self.data, pos + 28)? as usize;
-            let extra_len = u16le(self.data, pos + 30)? as usize;
-            let comment_len = u16le(self.data, pos + 32)? as usize;
-            let mut local_offset = u32le(self.data, pos + 42)? as u64;
-            let made_by = u16le(self.data, pos + 4)?;
-            let ext_attr = u32le(self.data, pos + 38)?;
-            if pos + 46 + name_len + extra_len + comment_len > self.data.len() {
-                return Err(invalid("truncated zip central directory entry"));
-            }
-            let name_bytes = &self.data[pos + 46..pos + 46 + name_len];
-            let extra = &self.data[pos + 46 + name_len..pos + 46 + name_len + extra_len];
-            let (z64_uncomp, z64_comp, z64_off) = zip64_extra(extra);
-            if comp_size == U32_MAX_AS_U64 {
-                comp_size = z64_comp.ok_or_else(|| invalid("missing zip64 compressed size"))?;
-            }
-            if uncomp_size == U32_MAX_AS_U64 {
-                uncomp_size =
-                    z64_uncomp.ok_or_else(|| invalid("missing zip64 uncompressed size"))?;
-            }
-            if local_offset == U32_MAX_AS_U64 {
-                local_offset =
-                    z64_off.ok_or_else(|| invalid("missing zip64 header offset"))?;
-            }
-            if flags & FLAG_ENCRYPTED != 0 {
-                return Err(unsupported("encrypted zip entries are not supported"));
-            }
-            let name = decode_name(name_bytes, flags)?;
-            let unix_mode = if made_by >> 8 == 3 {
-                Some(ext_attr >> 16)
-            } else {
-                None
-            };
-            pos += 46 + name_len + extra_len + comment_len;
-            entries.push(ZipIndexEntry {
-                name,
-                method,
-                uncompressed_size: uncomp_size,
-                compressed_size: comp_size,
-                crc32: crc,
-                unix_mode,
-                local_offset,
-                flags,
-            });
-        }
-        // cd_size is advisory; the entry walk above is authoritative.
-        let _ = cd_size;
-        Ok(entries)
+        let (cd_offset, cd_size, count) = locate_central_dir(self.data)?;
+        parse_central_records(self.data, cd_offset, cd_size, count)
     }
 
     /// Find an index entry by name.
@@ -709,46 +678,117 @@ impl<'a> ZipReader<'a> {
             data,
         })
     }
+}
 
-    fn locate_central_dir(&self) -> Result<(usize, u64, usize)> {
-        let data = self.data;
-        if data.len() < 22 {
-            return Err(invalid("file too small to be a zip archive"));
-        }
-        // EOCD is within the last 64 KiB + 22 bytes.
-        let scan_start = data.len().saturating_sub(0xFFFF + 22);
-        let mut eocd = None;
-        let mut pos = data.len() - 22;
-        loop {
-            if data.len() >= pos + 4 && u32le(data, pos).unwrap_or(0) == SIG_EOCD {
-                eocd = Some(pos);
-                break;
-            }
-            if pos == scan_start {
-                break;
-            }
-            pos -= 1;
-        }
-        let eocd = eocd.ok_or_else(|| invalid("zip end-of-central-directory not found"))?;
-        let mut count = u16le(data, eocd + 10)? as usize;
-        let mut cd_size = u32le(data, eocd + 12)? as u64;
-        let mut cd_offset = u32le(data, eocd + 16)? as u64;
-        // ZIP64 locator directly precedes EOCD when present.
-        if eocd >= 20 && u32le(data, eocd - 20).unwrap_or(0) == SIG_LOCATOR64 {
-            let eocd64_off = u64le(data, eocd - 12)? as usize;
-            if eocd64_off + 56 <= data.len()
-                && u32le(data, eocd64_off).unwrap_or(0) == SIG_EOCD64
-            {
-                count = u64le(data, eocd64_off + 32)? as usize;
-                cd_size = u64le(data, eocd64_off + 40)?;
-                cd_offset = u64le(data, eocd64_off + 48)?;
-            }
-        }
-        if cd_offset + cd_size > data.len() as u64 {
-            return Err(invalid("zip central directory out of bounds"));
-        }
-        Ok((cd_offset as usize, cd_size, count))
+/// Locate the central directory in raw archive bytes.
+/// Returns `(offset, size, entry_count)`.
+fn locate_central_dir(data: &[u8]) -> Result<(usize, u64, usize)> {
+    if data.len() < 22 {
+        return Err(invalid("file too small to be a zip archive"));
     }
+    // EOCD is within the last 64 KiB + 22 bytes.
+    let scan_start = data.len().saturating_sub(0xFFFF + 22);
+    let mut eocd = None;
+    let mut pos = data.len() - 22;
+    loop {
+        if data.len() >= pos + 4 && u32le(data, pos).unwrap_or(0) == SIG_EOCD {
+            eocd = Some(pos);
+            break;
+        }
+        if pos == scan_start {
+            break;
+        }
+        pos -= 1;
+    }
+    let eocd = eocd.ok_or_else(|| invalid("zip end-of-central-directory not found"))?;
+    let mut count = u16le(data, eocd + 10)? as usize;
+    let mut cd_size = u32le(data, eocd + 12)? as u64;
+    let mut cd_offset = u32le(data, eocd + 16)? as u64;
+    // ZIP64 locator directly precedes EOCD when present.
+    if eocd >= 20 && u32le(data, eocd - 20).unwrap_or(0) == SIG_LOCATOR64 {
+        let eocd64_off = u64le(data, eocd - 12)? as usize;
+        if eocd64_off + 56 <= data.len()
+            && u32le(data, eocd64_off).unwrap_or(0) == SIG_EOCD64
+        {
+            count = u64le(data, eocd64_off + 32)? as usize;
+            cd_size = u64le(data, eocd64_off + 40)?;
+            cd_offset = u64le(data, eocd64_off + 48)?;
+        }
+    }
+    if cd_offset + cd_size > data.len() as u64 {
+        return Err(invalid("zip central directory out of bounds"));
+    }
+    Ok((cd_offset as usize, cd_size, count))
+}
+
+/// Parse central-directory records from raw bytes at `cd_offset`.
+fn parse_central_records(
+    data: &[u8],
+    cd_offset: usize,
+    cd_size: u64,
+    count: usize,
+) -> Result<Vec<ZipIndexEntry>> {
+    let mut entries = Vec::with_capacity(count.min(1_000_000));
+    let mut pos = cd_offset;
+    for _ in 0..count {
+        if pos + 46 > data.len() {
+            return Err(invalid("truncated zip central directory"));
+        }
+        if u32le(data, pos)? != SIG_CENTRAL {
+            return Err(invalid("bad zip central directory signature"));
+        }
+        let flags = u16le(data, pos + 8)?;
+        let method = ZipMethod::from_code(u16le(data, pos + 10)?)?;
+        let crc = u32le(data, pos + 16)?;
+        let mut comp_size = u32le(data, pos + 20)? as u64;
+        let mut uncomp_size = u32le(data, pos + 24)? as u64;
+        let name_len = u16le(data, pos + 28)? as usize;
+        let extra_len = u16le(data, pos + 30)? as usize;
+        let comment_len = u16le(data, pos + 32)? as usize;
+        let mut local_offset = u32le(data, pos + 42)? as u64;
+        let made_by = u16le(data, pos + 4)?;
+        let ext_attr = u32le(data, pos + 38)?;
+        if pos + 46 + name_len + extra_len + comment_len > data.len() {
+            return Err(invalid("truncated zip central directory entry"));
+        }
+        let name_bytes = &data[pos + 46..pos + 46 + name_len];
+        let extra = &data[pos + 46 + name_len..pos + 46 + name_len + extra_len];
+        let (z64_uncomp, z64_comp, z64_off) = zip64_extra(extra);
+        if comp_size == U32_MAX_AS_U64 {
+            comp_size = z64_comp.ok_or_else(|| invalid("missing zip64 compressed size"))?;
+        }
+        if uncomp_size == U32_MAX_AS_U64 {
+            uncomp_size =
+                z64_uncomp.ok_or_else(|| invalid("missing zip64 uncompressed size"))?;
+        }
+        if local_offset == U32_MAX_AS_U64 {
+            local_offset =
+                z64_off.ok_or_else(|| invalid("missing zip64 header offset"))?;
+        }
+        if flags & FLAG_ENCRYPTED != 0 {
+            return Err(unsupported("encrypted zip entries are not supported"));
+        }
+        let name = decode_name(name_bytes, flags)?;
+        let unix_mode = if made_by >> 8 == 3 {
+            Some(ext_attr >> 16)
+        } else {
+            None
+        };
+        pos += 46 + name_len + extra_len + comment_len;
+        entries.push(ZipIndexEntry {
+            name,
+            method,
+            uncompressed_size: uncomp_size,
+            compressed_size: comp_size,
+            crc32: crc,
+            unix_mode,
+            local_offset,
+            flags,
+        });
+    }
+    // cd_size is advisory; the entry walk above is authoritative.
+    let _ = cd_size;
+    Ok(entries)
 }
 
 fn decode_name(bytes: &[u8], flags: u16) -> Result<String> {
@@ -782,6 +822,542 @@ pub fn zip_pack(files: &[(&str, &[u8])], options: &ZipWriterOptions) -> Result<V
 /// Unpack a ZIP archive into entries.
 pub fn zip_unpack(data: &[u8]) -> Result<Vec<ZipEntry>> {
     ZipReader::new(data).read_all()
+}
+
+// ---------------------------------------------------------------------------
+// File APIs (constant memory for huge archives)
+// ---------------------------------------------------------------------------
+
+/// Write adapter that hashes everything passing through.
+struct HashWriter<W> {
+    inner: W,
+    crc: Crc32,
+    written: u64,
+}
+
+impl<W> HashWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            crc: Crc32::new(),
+            written: 0,
+        }
+    }
+}
+
+impl<W: Write> Write for HashWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.crc.update(&buf[..n]);
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Copy exactly `n` bytes (bounded RAM, 1 MiB chunks).
+fn copy_exact(src: &mut File, dst: &mut impl Write, mut n: u64) -> Result<()> {
+    let mut buf = vec![0u8; 1024 * 1024];
+    while n > 0 {
+        let want = (buf.len() as u64).min(n) as usize;
+        let mut got = 0;
+        while got < want {
+            match src.read(&mut buf[got..want]) {
+                Ok(0) => return Err(invalid("truncated zip entry data")),
+                Ok(k) => got += k,
+                Err(e) => return Err(ArchiveError::Io(e.to_string())),
+            }
+        }
+        dst.write_all(&buf[..got]).map_err(ArchiveError::from)?;
+        n -= got as u64;
+    }
+    Ok(())
+}
+
+fn read_exact_file(file: &mut File, mut buf: &mut [u8]) -> Result<()> {
+    while !buf.is_empty() {
+        match file.read(buf) {
+            Ok(0) => return Err(invalid("truncated zip file")),
+            Ok(n) => buf = &mut buf[n..],
+            Err(e) => return Err(ArchiveError::Io(e.to_string())),
+        }
+    }
+    Ok(())
+}
+
+/// Reject absolute paths and `..` escapes (file extraction gate).
+fn validate_zip_extract_path(path: &str) -> Result<()> {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        return Err(ArchiveError::UnsafePath(path.to_string()));
+    }
+    let mut depth = 0i32;
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(ArchiveError::UnsafePath(path.to_string()));
+                }
+            }
+            Component::Normal(_) => depth += 1,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Parse a 30-byte local file header.
+/// Returns `(method, flags, name_len, extra_len)`.
+fn parse_local_header(buf: &[u8; 30]) -> Result<(ZipMethod, u16, usize, usize)> {
+    if u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) != SIG_LOCAL {
+        return Err(invalid("bad zip local header signature"));
+    }
+    let flags = u16::from_le_bytes([buf[6], buf[7]]);
+    let method = ZipMethod::from_code(u16::from_le_bytes([buf[8], buf[9]]))?;
+    let name_len = u16::from_le_bytes([buf[26], buf[27]]) as usize;
+    let extra_len = u16::from_le_bytes([buf[28], buf[29]]) as usize;
+    Ok((method, flags, name_len, extra_len))
+}
+
+/// File-backed ZIP reader: the index comes from the tail, entries stream
+/// straight from disk with bounded RAM (100 GB archives welcome).
+pub struct ZipFileReader {
+    file: File,
+    len: u64,
+    index: Vec<ZipIndexEntry>,
+}
+
+impl ZipFileReader {
+    /// Open an archive; only the tail plus the central directory are read.
+    pub fn open(path: &Path) -> Result<Self> {
+        let mut file = File::open(path).map_err(ArchiveError::from)?;
+        let len = file.metadata().map_err(ArchiveError::from)?.len();
+        let tail_len = len.min(0xFFFF + 22);
+        if tail_len < 22 {
+            return Err(invalid("file too small to be a zip archive"));
+        }
+        file.seek(SeekFrom::Start(len - tail_len))
+            .map_err(ArchiveError::from)?;
+        let mut tail = vec![0u8; tail_len as usize];
+        read_exact_file(&mut file, &mut tail)?;
+        let tail_base = len - tail_len;
+        // EOCD scan inside the tail (absolute = tail_base + rel).
+        let mut eocd_rel: Option<usize> = None;
+        let mut pos = tail.len() - 22;
+        let scan_start = tail.len().saturating_sub(0xFFFF + 22);
+        loop {
+            if u32le(&tail, pos).unwrap_or(0) == SIG_EOCD {
+                eocd_rel = Some(pos);
+                break;
+            }
+            if pos == scan_start {
+                break;
+            }
+            pos -= 1;
+        }
+        let eocd_rel = eocd_rel.ok_or_else(|| invalid("zip end-of-central-directory not found"))?;
+        let eocd_abs = tail_base + eocd_rel as u64;
+        let mut count = u16le(&tail, eocd_rel + 10)? as usize;
+        let mut cd_size = u32le(&tail, eocd_rel + 12)? as u64;
+        let mut cd_offset = u32le(&tail, eocd_rel + 16)? as u64;
+        // ZIP64 locator sits right before EOCD; read it from the file so
+        // huge-comment archives (locator outside the tail) still work.
+        if eocd_abs >= 20 {
+            let mut loc = [0u8; 20];
+            file.seek(SeekFrom::Start(eocd_abs - 20))
+                .map_err(ArchiveError::from)?;
+            read_exact_file(&mut file, &mut loc)?;
+            if u32::from_le_bytes([loc[0], loc[1], loc[2], loc[3]]) == SIG_LOCATOR64 {
+                let eocd64_off = u64::from_le_bytes(loc[8..16].try_into().unwrap());
+                let mut rec = [0u8; 56];
+                file.seek(SeekFrom::Start(eocd64_off))
+                    .map_err(ArchiveError::from)?;
+                read_exact_file(&mut file, &mut rec)?;
+                if u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) != SIG_EOCD64 {
+                    return Err(invalid("bad zip64 end record"));
+                }
+                count = u64::from_le_bytes(rec[32..40].try_into().unwrap()) as usize;
+                cd_size = u64::from_le_bytes(rec[40..48].try_into().unwrap());
+                cd_offset = u64::from_le_bytes(rec[48..56].try_into().unwrap());
+            }
+        }
+        if cd_offset + cd_size > len {
+            return Err(invalid("zip central directory out of bounds"));
+        }
+        file.seek(SeekFrom::Start(cd_offset))
+            .map_err(ArchiveError::from)?;
+        let mut central = vec![0u8; cd_size as usize];
+        read_exact_file(&mut file, &mut central)?;
+        let index = parse_central_records(&central, 0, cd_size, count)?;
+        Ok(Self { file, len, index })
+    }
+
+    /// Archive byte size.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// True for empty files.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Central-directory index (metadata only).
+    pub fn index(&self) -> &[ZipIndexEntry] {
+        &self.index
+    }
+
+    /// Stream one entry into `out` (hash-checked). Returns payload bytes.
+    pub fn extract_entry_to_writer(
+        &mut self,
+        name: &str,
+        out: &mut impl Write,
+    ) -> Result<u64> {
+        let idx = self
+            .index
+            .iter()
+            .find(|e| e.name == name)
+            .cloned()
+            .ok_or_else(|| ArchiveError::NotFound(name.to_string()))?;
+        if idx.is_dir() {
+            return Ok(0);
+        }
+        self.file
+            .seek(SeekFrom::Start(idx.local_offset))
+            .map_err(ArchiveError::from)?;
+        let mut head = [0u8; 30];
+        read_exact_file(&mut self.file, &mut head)?;
+        let (l_method, _l_flags, name_len, extra_len) = parse_local_header(&head)?;
+        if l_method != idx.method {
+            return Err(invalid("zip local/central method mismatch"));
+        }
+        let skip = name_len as u64 + extra_len as u64;
+        self.file
+            .seek(SeekFrom::Current(skip as i64))
+            .map_err(ArchiveError::from)?;
+        let mut hashed = HashWriter::new(out);
+        match idx.method {
+            ZipMethod::Stored => {
+                if idx.compressed_size != idx.uncompressed_size {
+                    return Err(invalid("stored zip sizes disagree"));
+                }
+                copy_exact(&mut self.file, &mut hashed, idx.compressed_size)?;
+            }
+            ZipMethod::Deflate => {
+                use std::io::Take;
+                let take: Take<&mut File> =
+                    std::io::Read::by_ref(&mut self.file).take(idx.compressed_size);
+                let (written, _read) = crate::deflate::decompress_stream(
+                    take,
+                    &mut hashed,
+                    u64::MAX,
+                )?;
+                let _ = written;
+            }
+        }
+        hashed.flush().map_err(ArchiveError::from)?;
+        if hashed.written != idx.uncompressed_size {
+            return Err(invalid("zip uncompressed size mismatch"));
+        }
+        if hashed.crc.finalize() != idx.crc32 {
+            return Err(ArchiveError::ChecksumMismatch {
+                expected: idx.crc32,
+                actual: hashed.crc.finalize(),
+                entry: name.to_string(),
+            });
+        }
+        Ok(hashed.written)
+    }
+
+    /// Stream one entry straight into a file (parents created).
+    pub fn extract_entry_to_path(&mut self, name: &str, dest: &Path) -> Result<u64> {
+        if let Some(parent) = dest.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(ArchiveError::from)?;
+            }
+        }
+        let mut f = File::create(dest).map_err(ArchiveError::from)?;
+        let n = self.extract_entry_to_writer(name, &mut f)?;
+        f.flush().map_err(ArchiveError::from)?;
+        Ok(n)
+    }
+
+    /// Extract everything into `dir` (paths validated before any write).
+    pub fn extract_all_to(&mut self, dir: &Path) -> Result<()> {
+        let names: Vec<String> = self.index.iter().map(|e| e.name.clone()).collect();
+        for n in &names {
+            validate_zip_extract_path(n)?;
+        }
+        std::fs::create_dir_all(dir).map_err(ArchiveError::from)?;
+        // Clone the index so entry borrows don't cross the &mut calls.
+        let index = self.index.clone();
+        for e in &index {
+            let dest = dir.join(Path::new(&e.name));
+            if e.is_dir() {
+                std::fs::create_dir_all(&dest).map_err(ArchiveError::from)?;
+                continue;
+            }
+            if is_zip_symlink(e) {
+                #[cfg(unix)]
+                {
+                    let mut target = Vec::new();
+                    self.extract_entry_to_writer(&e.name, &mut target)?;
+                    let target = String::from_utf8(target)
+                        .map_err(|_| invalid("zip symlink target is not utf-8"))?;
+                    if let Some(parent) = dest.parent() {
+                        std::fs::create_dir_all(parent).map_err(ArchiveError::from)?;
+                    }
+                    let _ = std::fs::remove_file(&dest);
+                    std::os::unix::fs::symlink(&target, &dest).map_err(ArchiveError::from)?;
+                    continue;
+                }
+                #[cfg(not(unix))]
+                {
+                    return Err(crate::error::unsupported(
+                        "zip symlink extraction needs Unix",
+                    ));
+                }
+            }
+            self.extract_entry_to_path(&e.name, &dest)?;
+            #[cfg(unix)]
+            if let Some(mode) = e.unix_mode {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &dest,
+                    std::fs::Permissions::from_mode(mode & 0o7777),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_zip_symlink(e: &ZipIndexEntry) -> bool {
+    matches!(e.unix_mode, Some(m) if m & 0o170_000 == 0o120_000)
+}
+
+/// File-backed ZIP writer: local data streams to disk, only the central
+/// directory is buffered (bounded by entry count, not content size).
+pub struct ZipFileWriter {
+    file: std::io::BufWriter<File>,
+    central: Vec<CentralRecord>,
+    comment: String,
+    offset: u64,
+    level: CompressionLevel,
+}
+
+impl ZipFileWriter {
+    /// Create a new archive file (parents created).
+    pub fn create(path: &Path) -> Result<Self> {
+        Self::create_with_options(path, ZipWriterOptions::default())
+    }
+
+    /// Create with custom options (level, comment).
+    pub fn create_with_options(path: &Path, options: ZipWriterOptions) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(ArchiveError::from)?;
+            }
+        }
+        let file = File::create(path).map_err(ArchiveError::from)?;
+        Ok(Self {
+            file: std::io::BufWriter::new(file),
+            central: Vec::new(),
+            comment: options.comment,
+            offset: 0,
+            level: options.level,
+        })
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+        self.file.write_all(bytes).map_err(ArchiveError::from)?;
+        self.offset += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Append a directory entry.
+    pub fn append_dir(&mut self, name: &str) -> Result<()> {
+        let mut n = name.to_string();
+        if !n.ends_with('/') {
+            n.push('/');
+        }
+        check_entry_name(&n)?;
+        let header = render_local_dir(n.as_bytes());
+        let local_offset = self.offset;
+        self.write_all(&header)?;
+        self.central.push(CentralRecord {
+            name: n.into_bytes(),
+            method: ZipMethod::Stored,
+            crc: 0,
+            comp_size: 0,
+            uncomp_size: 0,
+            local_offset,
+            unix_mode: 0o755 << 16 | 0x10,
+            is_dir: true,
+        });
+        Ok(())
+    }
+
+    /// Append a file from memory (deflate compresses first, like `ZipWriter`).
+    pub fn append_file(&mut self, name: &str, data: &[u8]) -> Result<()> {
+        let method = if data.is_empty() {
+            ZipMethod::Stored
+        } else {
+            match self.level {
+                CompressionLevel::None => ZipMethod::Stored,
+                _ => ZipMethod::Deflate,
+            }
+        };
+        self.append_file_with_method(name, data, method, 0o644)
+    }
+
+    /// Append a file from memory with explicit method and mode.
+    pub fn append_file_with_method(
+        &mut self,
+        name: &str,
+        data: &[u8],
+        method: ZipMethod,
+        unix_mode: u32,
+    ) -> Result<()> {
+        check_entry_name(name)?;
+        let mut crc = Crc32::new();
+        crc.update(data);
+        let compressed: Vec<u8>;
+        let payload: &[u8] = match method {
+            ZipMethod::Stored => data,
+            ZipMethod::Deflate => {
+                compressed = compress_raw(data, self.level);
+                &compressed
+            }
+        };
+        let local_offset = self.offset;
+        self.write_all(&render_local(
+            name.as_bytes(),
+            method,
+            crc.finalize(),
+            payload.len() as u64,
+            data.len() as u64,
+            local_offset,
+        ))?;
+        self.write_all(payload)?;
+        self.central.push(CentralRecord {
+            name: name.as_bytes().to_vec(),
+            method,
+            crc: crc.finalize(),
+            comp_size: payload.len() as u64,
+            uncomp_size: data.len() as u64,
+            local_offset,
+            unix_mode,
+            is_dir: false,
+        });
+        Ok(())
+    }
+
+    /// Append a file from disk with constant memory.
+    ///
+    /// Stored entries stream in 1 MiB chunks (CRC pre-pass, then copy).
+    /// Deflate entries are read fully first (documented limit).
+    pub fn append_file_from_disk(
+        &mut self,
+        name: &str,
+        src: &Path,
+        method: ZipMethod,
+    ) -> Result<()> {
+        check_entry_name(name)?;
+        let meta = std::fs::symlink_metadata(src).map_err(ArchiveError::from)?;
+        if !meta.is_file() {
+            return Err(invalid("zip file source is not a regular file"));
+        }
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            meta.permissions().mode() & 0o7777
+        };
+        #[cfg(not(unix))]
+        let mode = 0o644u32;
+        match method {
+            ZipMethod::Stored => {
+                // Pass 1: CRC32 over the source file.
+                let mut crc = Crc32::new();
+                let mut f = File::open(src).map_err(ArchiveError::from)?;
+                let mut buf = vec![0u8; 1024 * 1024];
+                let mut size = 0u64;
+                loop {
+                    let n = f.read(&mut buf).map_err(ArchiveError::from)?;
+                    if n == 0 {
+                        break;
+                    }
+                    crc.update(&buf[..n]);
+                    size += n as u64;
+                }
+                // Pass 2: header plus streamed copy.
+                let local_offset = self.offset;
+                self.write_all(&render_local(
+                    name.as_bytes(),
+                    ZipMethod::Stored,
+                    crc.finalize(),
+                    size,
+                    size,
+                    local_offset,
+                ))?;
+                let mut f = File::open(src).map_err(ArchiveError::from)?;
+                let mut hasher = HashWriter::new(&mut self.file);
+                copy_exact_file(&mut f, &mut hasher, size)?;
+                hasher.flush().map_err(ArchiveError::from)?;
+                debug_assert_eq!(hasher.crc.finalize(), crc.finalize());
+                debug_assert_eq!(hasher.written, size);
+                drop(hasher);
+                // The streamed copy bypassed write_all: track it manually.
+                self.offset += size;
+                self.central.push(CentralRecord {
+                    name: name.as_bytes().to_vec(),
+                    method: ZipMethod::Stored,
+                    crc: crc.finalize(),
+                    comp_size: size,
+                    uncomp_size: size,
+                    local_offset,
+                    unix_mode: mode,
+                    is_dir: false,
+                });
+                Ok(())
+            }
+            ZipMethod::Deflate => {
+                let data = std::fs::read(src).map_err(ArchiveError::from)?;
+                self.append_file_with_method(name, &data, ZipMethod::Deflate, mode)
+            }
+        }
+    }
+
+    /// Finish the archive (central directory + EOCD) and flush to disk.
+    pub fn finish(mut self) -> Result<()> {
+        let tail = render_central(&self.central, &self.comment, self.offset);
+        self.write_all(&tail)?;
+        self.file.flush().map_err(ArchiveError::from)?;
+        Ok(())
+    }
+}
+
+/// Copy exactly `n` bytes between files with bounded RAM.
+fn copy_exact_file(src: &mut File, dst: &mut impl Write, mut n: u64) -> Result<()> {
+    let mut buf = vec![0u8; 1024 * 1024];
+    while n > 0 {
+        let want = (buf.len() as u64).min(n) as usize;
+        let mut got = 0;
+        while got < want {
+            match src.read(&mut buf[got..want]) {
+                Ok(0) => return Err(invalid("truncated zip file source")),
+                Ok(k) => got += k,
+                Err(e) => return Err(ArchiveError::Io(e.to_string())),
+            }
+        }
+        dst.write_all(&buf[..got]).map_err(ArchiveError::from)?;
+        n -= got as u64;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -888,8 +1464,7 @@ mod tests {
     }
 
     #[test]
-    fn index_only_lists_without_decoding() {
-        let files: &[(&str, &[u8])] = &[
+    fn index_only_lists_without_decoding() {        let files: &[(&str, &[u8])] = &[
             ("a.txt", b"aaa"),
             ("sub/b.txt", b"bbb compress me bbb"),
         ];
@@ -915,5 +1490,61 @@ mod tests {
     #[test]
     fn garbage_rejected() {
         assert!(zip_unpack(b"definitely not a zip file....................").is_err());
+    }
+
+    #[test]
+    fn file_api_roundtrip() {
+        use std::path::Path;
+        let dir = std::env::temp_dir().join("archivekit_zipfile_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload: Vec<u8> = (0..500_000u32).map(|i| (i % 251) as u8).collect();
+
+        // Writer (buffered deflate + streamed stored from disk).
+        std::fs::write(dir.join("big.bin"), &payload).unwrap();
+        let mut w = ZipFileWriter::create(&dir.join("test.zip")).unwrap();
+        w.append_dir("docs").unwrap();
+        w.append_file("docs/a.txt", b"hello file api").unwrap();
+        w.append_file_from_disk("big.bin", &dir.join("big.bin"), ZipMethod::Stored)
+            .unwrap();
+        w.finish().unwrap();
+
+        // Reader: index only, single entry, full extract.
+        let mut r = ZipFileReader::open(&dir.join("test.zip")).unwrap();
+        assert_eq!(r.index().len(), 3);
+        assert!(r.len() > payload.len() as u64);
+        let mut one = Vec::new();
+        r.extract_entry_to_writer("docs/a.txt", &mut one).unwrap();
+        assert_eq!(one, b"hello file api");
+        assert!(matches!(
+            r.extract_entry_to_writer("nope", &mut Vec::new()),
+            Err(ArchiveError::NotFound(_))
+        ));
+        r.extract_all_to(&dir.join("out")).unwrap();
+        assert_eq!(std::fs::read(dir.join("out/big.bin")).unwrap(), payload);
+
+        // File output is a valid zip for the slice reader too.
+        let raw = std::fs::read(dir.join("test.zip")).unwrap();
+        assert_eq!(zip_unpack(&raw).unwrap().len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_api_deflate_from_disk() {
+        use std::path::Path;
+        let dir = std::env::temp_dir().join("archivekit_zipfile_deflate_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = b"compressible ".repeat(20_000);
+        std::fs::write(dir.join("t.txt"), &payload).unwrap();
+        let mut w = ZipFileWriter::create(&dir.join("t.zip")).unwrap();
+        w.append_file_from_disk("t.txt", &dir.join("t.txt"), ZipMethod::Deflate)
+            .unwrap();
+        w.finish().unwrap();
+        let mut r = ZipFileReader::open(&dir.join("t.zip")).unwrap();
+        let mut out = Vec::new();
+        r.extract_entry_to_writer("t.txt", &mut out).unwrap();
+        assert_eq!(out, payload);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

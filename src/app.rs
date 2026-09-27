@@ -1161,7 +1161,7 @@ mod tests {
         assert_eq!(info.layers, vec!["layer/00.tlyr".to_string()]);
         assert!(validate_tico(b"not a zip").is_err());
         // Bad tlyr magic.
-        let mut bad = minimal_tico();
+        let bad = minimal_tico();
         let entries = crate::zip::zip_unpack(&bad).unwrap();
         let _ = entries;
         // Craft invalid: png inside.
