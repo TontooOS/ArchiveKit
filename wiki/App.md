@@ -38,7 +38,7 @@ Written and parsed with FishFile (`.fico`):
 ```text
 app {
   bundle_id: com.tontoo.foo
-  version: 26.1.0
+  version: 27.0.0
   executable: App/foo
   icon: App/icon.tico
   name {

@@ -59,7 +59,7 @@ fn format_from_int(format: c_int) -> Result<Format, ()> {
 /// Library version string (do NOT free).
 #[no_mangle]
 pub extern "C" fn archivekit_version() -> *const c_char {
-    const VERSION_C: &[u8] = b"26.1.0\0";
+    const VERSION_C: &[u8] = b"27.0.0\0";
     VERSION_C.as_ptr() as *const c_char
 }
 

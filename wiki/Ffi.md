@@ -20,7 +20,7 @@ const char* archivekit_version(void);
 
 | Return | Meaning |
 |---|---|
-| pointer | Version string, e.g. `"26.1.0"` (do NOT free) |
+| pointer | Version string, e.g. `"27.0.0"` (do NOT free) |
 
 ### `archivekit_last_error`
 

@@ -4,7 +4,7 @@ ZIP, GZIP, TAR and `.app` single-file containers for TontooOS. Hand-written DEFL
 
 - Repository: https://github.com/TontooOS/ArchiveKit
 - License: TCL v26.1
-- Version: 26.1.0
+- Version: 27.0.0
 
 ## Feature Index
 
@@ -59,4 +59,4 @@ See [Combined.md](Combined.md), [App.md](App.md), [Tico.md](Tico.md), [Zip.md](Z
 - 2026-09-29: `.tico` icons moved from ZIP to the indexed TICO container (own `TICO`/`TICF` magic, `manifest.fico` FishFile manifest, `layer/*.tlyr` entries, `TicoBuilder`/`TicoReader`); `validate_tico` enforces the new format; `Format::Tico` added to detection, dir packing, extraction and the C FFI (code 6)
 - 2026-09-27: GZIP single-pass decode, ZIP capacity hints, fuzz harness (120k cases clean) + overflow hardening
 - 2026-09-27: Added `.app` containers (TAPP) with FishFile manifest, tico icons and random access
-- 2026-09-27: Initial wiki for ArchiveKit 26.1.0
+- 2026-09-27: Initial wiki for ArchiveKit 27.0.0

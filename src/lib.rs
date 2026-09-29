@@ -38,7 +38,7 @@ pub mod zip;
 pub const ARCHIVEKIT_VERSION: (u32, u32, u32) = (26, 1, 0);
 
 /// Library version string.
-pub const ARCHIVEKIT_VERSION_STR: &str = "26.1.0";
+pub const ARCHIVEKIT_VERSION_STR: &str = "27.0.0";
 
 pub use combined::{
     compress_bytes, compress_file, decompress_bytes, detect_format, extract_archive, extract_bytes,
