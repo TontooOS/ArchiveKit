@@ -1,6 +1,6 @@
 # TontooArchiveKit
 
-ZIP, GZIP, TAR and `.app` single-file containers for TontooOS. Hand-written codecs with minimal dependencies: DEFLATE (RFC 1951), GZIP (RFC 1952), TAR (ustar/PAX/GNU) and ZIP (Stored + Deflate, ZIP64, UTF-8, data descriptors), plus indexed TAPP app containers with FishFile manifests and `.tico` icons.
+ZIP, GZIP, TAR and indexed `.app` / `.tico` single-file containers for TontooOS. Hand-written codecs with minimal dependencies: DEFLATE (RFC 1951), GZIP (RFC 1952), TAR (ustar/PAX/GNU) and ZIP (Stored + Deflate, ZIP64, UTF-8, data descriptors), plus indexed TAPP app containers with FishFile manifests and TICO icon containers with FishFile manifests and `.tlyr` layers.
 
 ## Made for TontooOS
 

@@ -1,8 +1,9 @@
 /*
  * ArchiveKit - C Header
- * ZIP, GZIP, TAR and .app containers for TontooOS (codecs hand-written)
+ * ZIP, GZIP, TAR and indexed .app / .tico containers for TontooOS
+ * (codecs hand-written)
  *
- * Format codes: 1 = zip, 2 = gzip, 3 = tar, 4 = tar.gz, 5 = app
+ * Format codes: 1 = zip, 2 = gzip, 3 = tar, 4 = tar.gz, 5 = app, 6 = tico
  * Compression levels: 0 = none (stored), 1 = fastest, 2 = balanced, 3 = best
  */
 
@@ -90,7 +91,8 @@ uint8_t* archivekit_tar_gzip_compress(const uint8_t *input, size_t input_len, in
  *
  * @param input input bytes
  * @param input_len input length
- * @return 0 = unknown, 1 = zip, 2 = gzip, 3 = tar, 4 = tar.gz, 5 = app
+ * @return 0 = unknown, 1 = zip, 2 = gzip, 3 = tar, 4 = tar.gz, 5 = app,
+ *         6 = tico
  */
 int archivekit_detect_format(const uint8_t *input, size_t input_len);
 
@@ -108,11 +110,12 @@ char* archivekit_list_names(const uint8_t *input, size_t input_len);
 /* ======================== */
 
 /**
- * Compress a file or directory (format from code 1..4).
+ * Compress a file or directory (format from code 1..6).
  *
  * @param src source file or directory
  * @param dst destination archive
- * @param format 1 = zip, 2 = gzip, 3 = tar, 4 = tar.gz, 5 = app (dir only)
+ * @param format 1 = zip, 2 = gzip, 3 = tar, 4 = tar.gz, 5 = app (dir only),
+ *         6 = tico (manifest + layers, use TicoBuilder instead)
  * @return 0 on success, negative on error (see archivekit_last_error)
  */
 int archivekit_compress_file(const char *src, const char *dst, int format);
@@ -131,7 +134,8 @@ int archivekit_extract(const char *src, const char *dst_dir);
  *
  * @param src_dir source directory
  * @param dst destination archive
- * @param format 1 = zip, 2 = gzip (rejected), 3 = tar, 4 = tar.gz, 5 = app
+ * @param format 1 = zip, 2 = gzip (rejected), 3 = tar, 4 = tar.gz, 5 = app,
+ *         6 = tico
  * @param level 0..3
  * @return 0 on success, negative on error
  */

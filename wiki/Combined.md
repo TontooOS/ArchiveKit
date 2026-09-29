@@ -10,10 +10,12 @@ pub enum Format {
     Gzip,
     Tar,
     TarGzip,
+    App,
+    Tico,
 }
 ```
 
-`Format::default()` is `Zip`. Helpers: `Format::from_extension(path)` understands `.zip`, `.gz`, `.tar`, `.tar.gz`, `.tgz`; `Format::extension()` returns the canonical extension.
+`Format::default()` is `Zip`. Helpers: `Format::from_extension(path)` understands `.zip`, `.gz`, `.tar`, `.tar.gz`, `.tgz`, `.app`, `.tico`; `Format::extension()` returns the canonical extension.
 
 ### `detect_format`
 
@@ -21,7 +23,7 @@ pub enum Format {
 pub fn detect_format(data: &[u8]) -> Option<Format>
 ```
 
-Detects by magic: GZIP (`1F 8B`), ZIP (`PK` signatures), TAR (checksum-validated ustar block). Returns `None` for unknown input. GZIP-compressed TAR reports as `Gzip`; use the file extension or trial-parse the payload to tell plain GZIP from TAR+GZIP.
+Detects by magic: TAPP (`TAPP` header), TICO (`TICO` header), GZIP (`1F 8B`), ZIP (`PK` signatures), TAR (checksum-validated ustar block). Returns `None` for unknown input. GZIP-compressed TAR reports as `Gzip`; use the file extension or trial-parse the payload to tell plain GZIP from TAR+GZIP.
 
 ```rust
 use archivekit::{detect_format, gzip_compress, Format};
@@ -69,7 +71,7 @@ pub fn compress_bytes(data: &[u8], format: Format, level: CompressionLevel) -> R
 pub fn decompress_bytes(data: &[u8], format: Format) -> Result<Vec<u8>>
 ```
 
-`compress_bytes` with `Zip` wraps the input as a single `data.bin` entry; with `Tar`/`TarGzip` it returns `Err` (those need entries – use `tar_pack` / `tar_gzip_compress`). `decompress_bytes` with `Zip` returns the first entry's payload and errors on empty archives; with `Tar` it returns the input unchanged; with `TarGzip` it returns the raw TAR payload (parse with `tar_unpack`).
+`compress_bytes` with `Zip` wraps the input as a single `data.bin` entry; with `Tar`/`TarGzip` it returns `Err` (those need entries – use `tar_pack` / `tar_gzip_compress`); with `App`/`Tico` it returns `Err` (those need manifests – use `AppBuilder` / `TicoBuilder`). `decompress_bytes` with `Zip` returns the first entry's payload and errors on empty archives; with `Tar` it returns the input unchanged; with `TarGzip` it returns the raw TAR payload (parse with `tar_unpack`); with `App`/`Tico` it returns `Err` (use `AppReader` / `TicoReader` for indexed access).
 
 ### `list_names`
 
@@ -95,7 +97,7 @@ Compresses a file or directory into `dst`. With `format = None` the format comes
 pub fn pack_dir_to_archive(dir: &Path, format: Format, level: CompressionLevel) -> Result<Vec<u8>>
 ```
 
-Packs a directory recursively into `Zip`, `Tar` or `TarGzip` bytes. ZIP packing skips symlinks (no portable encoding); the TAR pipeline preserves them as link entries.
+Packs a directory recursively into `Zip`, `Tar`, `TarGzip`, `App` or `Tico` bytes. ZIP packing skips symlinks (no portable encoding); the TAR pipeline preserves them as link entries. `App` adopts `Info.tontoo` as the manifest; `Tico` packs `manifest.fico` plus the referenced `layer/*.tlyr` files (see [App.md](App.md), [Tico.md](Tico.md)).
 
 ### `extract_archive` / `extract_bytes`
 
@@ -104,7 +106,7 @@ pub fn extract_archive(src: &Path, dst_dir: &Path) -> Result<()>
 pub fn extract_bytes(data: &[u8], src_hint: Option<&Path>, dst_dir: &Path) -> Result<()>
 ```
 
-Extracts into a directory (created when missing). `.tar.gz`/`.tgz` extensions take the TAR+GZIP path; otherwise the format is auto-detected, and a GZIP payload that turns out to be TAR is unpacked as TAR. Plain multi-member GZIP yields one file per member. Unsafe ZIP paths are rejected before anything is written. TAR link entries are not recreated (`Unsupported`).
+Extracts into a directory (created when missing). `.tar.gz`/`.tgz` extensions take the TAR+GZIP path; otherwise the format is auto-detected (including `App` and `Tico` containers), and a GZIP payload that turns out to be TAR is unpacked as TAR. Plain multi-member GZIP yields one file per member. Unsafe ZIP paths are rejected before anything is written. TAR link entries are not recreated (`Unsupported`).
 
 ## Usage / Example
 

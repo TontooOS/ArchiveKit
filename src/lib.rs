@@ -1,10 +1,12 @@
-//! ArchiveKit – ZIP, GZIP, TAR and `.app` containers for TontooOS.
+//! ArchiveKit – ZIP, GZIP, TAR and indexed `.app` / `.tico` containers.
 //!
 //! 100% hand-written compression: DEFLATE (RFC 1951), GZIP (RFC 1952),
 //! TAR (ustar/PAX/GNU) and ZIP (Stored + Deflate, ZIP64, UTF-8, data
 //! descriptors). The `.app` container (TAPP) adds indexed single-file apps
-//! with FishFile manifests and `.tico` icons. Codecs are dependency-free
-//! (`std` only); only the app manifest uses FishFile.
+//! with FishFile manifests and `.tico` icons; `.tico` icons use the same
+//! indexed engine with their own `TICO` magic and a FishFile manifest.
+//! Codecs are dependency-free (`std` only); only the manifests use
+//! FishFile.
 //!
 //! # Quick Start
 //!
@@ -20,7 +22,7 @@
 //! let entries = tar_gzip_decompress(&tgz).unwrap();
 //! assert_eq!(entries[0].data, b"hello tgz");
 //! ```
-
+//!
 pub mod app;
 pub mod combined;
 pub mod crc;
@@ -29,6 +31,7 @@ pub mod error;
 pub mod ffi;
 pub mod gzip;
 pub mod tar;
+pub mod tico;
 pub mod zip;
 
 /// Library version: (major, minor, patch).
@@ -43,9 +46,14 @@ pub use combined::{
     tar_gzip_decompress, Format,
 };
 pub use app::{
-    app_extract_to_file, app_pack_dir, validate_tico, AppBuilder, AppEntryMeta, AppManifest,
-    AppMethod, AppReader, TicoInfo, APP_EXTENSION, APP_FOOTER_MAGIC, APP_MAGIC, APP_MANIFEST_NAME,
-    APP_VERSION,
+    app_extract_to_file, app_pack_dir, AppBuilder, AppEntryMeta, AppManifest, AppMethod,
+    AppReader, APP_EXTENSION, APP_FOOTER_MAGIC, APP_MAGIC, APP_MANIFEST_NAME, APP_VERSION,
+};
+pub use tico::{
+    tico_extract_to_file, tico_pack_bytes, tico_pack_dir, validate_tico, TicoBackground,
+    TicoBuilder, TicoEntryMeta, TicoInfo, TicoLayerMeta, TicoManifest, TicoMethod, TicoReader,
+    TICO_EXTENSION, TICO_FOOTER_LEN, TICO_FOOTER_MAGIC, TICO_MAGIC, TICO_MANIFEST_NAME,
+    TICO_VERSION, TLYR_MAGIC, TLYR_VERSION,
 };
 pub use deflate::CompressionLevel;
 pub use error::{ArchiveError, Result};

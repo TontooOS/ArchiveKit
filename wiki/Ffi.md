@@ -1,6 +1,6 @@
 # FFI
 
-C bindings for ArchiveKit (`Headers/archivekit.h`, implemented in `src/ffi.rs`). All functions are `no_mangle extern "C"`. Format codes are `1 = zip`, `2 = gzip`, `3 = tar`, `4 = tar.gz`, `5 = app`; levels are `0 = none`, `1 = fastest`, `2 = balanced`, `3 = best`.
+C bindings for ArchiveKit (`Headers/archivekit.h`, implemented in `src/ffi.rs`). All functions are `no_mangle extern "C"`. Format codes are `1 = zip`, `2 = gzip`, `3 = tar`, `4 = tar.gz`, `5 = app`, `6 = tico`; levels are `0 = none`, `1 = fastest`, `2 = balanced`, `3 = best`.
 
 ## Memory Rules
 
@@ -90,6 +90,7 @@ int archivekit_detect_format(const uint8_t *input, size_t input_len);
 | 3 | TAR |
 | 4 | TAR+GZIP hint (reserved; currently reported as 2) |
 | 5 | App (TAPP container) |
+| 6 | Tico (TICO container) |
 
 ### `archivekit_list_names`
 

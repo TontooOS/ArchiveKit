@@ -17,6 +17,7 @@ ZIP, GZIP, TAR and `.app` single-file containers for TontooOS. Hand-written DEFL
 | Tar | [Tar.md](Tar.md) | TAR reader/writer, PAX, GNU long names, directory I/O |
 | Zip | [Zip.md](Zip.md) | ZIP reader/writer, ZIP64, UTF-8, data descriptors |
 | App | [App.md](App.md) | `.app` containers, manifest, tico icons, random access |
+| Tico | [Tico.md](Tico.md) | `.tico` icon containers, fico manifest, layers, random access |
 | Combined | [Combined.md](Combined.md) | tar.gz pipeline, format detection, file and dir APIs |
 | Error | [Error.md](Error.md) | Error types and handling |
 | FFI | [Ffi.md](Ffi.md) | C header and interop |
@@ -50,11 +51,12 @@ int main(void) {
 }
 ```
 
-See [Combined.md](Combined.md), [App.md](App.md), [Zip.md](Zip.md), [Gzip.md](Gzip.md) and
-[Tar.md](Tar.md) for details.
+See [Combined.md](Combined.md), [App.md](App.md), [Tico.md](Tico.md), [Zip.md](Zip.md),
+[Gzip.md](Gzip.md) and [Tar.md](Tar.md) for details.
 
 ## Changelog
 
+- 2026-09-29: `.tico` icons moved from ZIP to the indexed TICO container (own `TICO`/`TICF` magic, `manifest.fico` FishFile manifest, `layer/*.tlyr` entries, `TicoBuilder`/`TicoReader`); `validate_tico` enforces the new format; `Format::Tico` added to detection, dir packing, extraction and the C FFI (code 6)
 - 2026-09-27: GZIP single-pass decode, ZIP capacity hints, fuzz harness (120k cases clean) + overflow hardening
 - 2026-09-27: Added `.app` containers (TAPP) with FishFile manifest, tico icons and random access
 - 2026-09-27: Initial wiki for ArchiveKit 26.1.0

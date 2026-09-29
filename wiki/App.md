@@ -85,7 +85,7 @@ pub struct TicoInfo {
 }
 ```
 
-Structural `.tico` validation with ArchiveKit's own ZIP reader, mirroring the rules in `CoreIcon/src/tico.rs`: the file is a ZIP holding `manifest.json` plus `layer/*.tlyr`; the manifest declares `"format": "tico"`; every `.tlyr` has `TLYR` magic, version byte `1` and a fitting payload length; every layer is referenced by the manifest and every `"file"` reference exists; no `.png` files. Returns `Err` otherwise. Decoding and rendering stay in CoreIcon.
+Structural `.tico` validation against the TICO container (see [Tico.md](Tico.md)): the file is a TICO container holding `manifest.fico` plus `layer/*.tlyr`; the manifest declares `format: tico` with a supported version; every `.tlyr` has `TLYR` magic, version byte `1` and a fitting payload length; every layer is referenced by the manifest and every `file` reference exists; no `.png` files and no unexpected files. Returns `Err` otherwise. The canonical definitions live in `src/tico.rs` and are re-exported here, so `archivekit::app::validate_tico` keeps working. Decoding and rendering stay in CoreIcon.
 
 ## Builder
 
@@ -196,7 +196,7 @@ fn main() -> archivekit::Result<()> {
 ## Cross References
 
 - [Combined.md](Combined.md) – `Format::App`, detection, file and dir APIs
-- [Zip.md](Zip.md) – engine used for `.tico` validation
+- [Tico.md](Tico.md) – TICO icon containers sharing the indexed engine
 - [Deflate.md](Deflate.md) – engine behind Deflate entries
 - [Error.md](Error.md) – `NotFound`, `UnsafePath`, `ChecksumMismatch`
 - [Ffi.md](Ffi.md) – C API for open/list/read/manifest/extract/pack

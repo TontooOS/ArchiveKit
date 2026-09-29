@@ -48,6 +48,7 @@ fn format_from_int(format: c_int) -> Result<Format, ()> {
         3 => Ok(Format::Tar),
         4 => Ok(Format::TarGzip),
         5 => Ok(Format::App),
+        6 => Ok(Format::Tico),
         _ => {
             set_error(format!("unknown format code {format}"));
             Err(())
@@ -196,7 +197,8 @@ pub unsafe extern "C" fn archivekit_tar_gzip_compress(
     }
 }
 
-/// Detect the archive format: 0 = unknown, 1 = zip, 2 = gzip, 3 = tar.
+/// Detect the archive format: 0 = unknown, 1 = zip, 2 = gzip, 3 = tar,
+/// 4 = tar.gz, 5 = app, 6 = tico.
 ///
 /// # Safety
 /// `input` must point to `input_len` readable bytes.
@@ -213,6 +215,7 @@ pub unsafe extern "C" fn archivekit_detect_format(input: *const u8, input_len: u
         Some(Format::Tar) => 3,
         Some(Format::TarGzip) => 4,
         Some(Format::App) => 5,
+        Some(Format::Tico) => 6,
         None => 0,
     }
 }

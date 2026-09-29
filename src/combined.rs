@@ -28,6 +28,8 @@ pub enum Format {
     TarGzip,
     /// TontooOS app container (`.app`, TAPP with central directory).
     App,
+    /// TontooOS icon container (`.tico`, TICO with central directory).
+    Tico,
 }
 
 impl Format {
@@ -38,6 +40,8 @@ impl Format {
             Some(Format::TarGzip)
         } else if name.ends_with(".app") {
             Some(Format::App)
+        } else if name.ends_with(".tico") {
+            Some(Format::Tico)
         } else if name.ends_with(".zip") {
             Some(Format::Zip)
         } else if name.ends_with(".gz") {
@@ -57,6 +61,7 @@ impl Format {
             Format::Tar => "tar",
             Format::TarGzip => "tar.gz",
             Format::App => "app",
+            Format::Tico => "tico",
         }
     }
 }
@@ -71,6 +76,11 @@ pub fn detect_format(data: &[u8]) -> Option<Format> {
         && u32::from_le_bytes([data[0], data[1], data[2], data[3]]) == crate::app::APP_MAGIC
     {
         return Some(Format::App);
+    }
+    if data.len() >= 8
+        && u32::from_le_bytes([data[0], data[1], data[2], data[3]]) == crate::tico::TICO_MAGIC
+    {
+        return Some(Format::Tico);
     }
     if data.len() >= 2 && data[0] == 0x1F && data[1] == 0x8B {
         return Some(Format::Gzip);
@@ -146,6 +156,9 @@ pub fn compress_bytes(data: &[u8], format: Format, level: CompressionLevel) -> R
         Format::App => Err(invalid(
             "app needs a manifest and tree: use AppBuilder or app_pack_dir() instead",
         )),
+        Format::Tico => Err(invalid(
+            "tico needs a manifest and layers: use TicoBuilder or tico_pack_dir() instead",
+        )),
     }
 }
 
@@ -167,6 +180,9 @@ pub fn decompress_bytes(data: &[u8], format: Format) -> Result<Vec<u8>> {
         Format::TarGzip => tar_gzip_decompress_raw(data),
         Format::App => Err(invalid(
             "app needs indexed access: use AppReader::read_file() instead",
+        )),
+        Format::Tico => Err(invalid(
+            "tico needs indexed access: use TicoReader::read_file() instead",
         )),
     }
 }
@@ -229,6 +245,7 @@ pub fn pack_dir_to_archive(dir: &Path, format: Format, level: CompressionLevel) 
             }
             builder.finish()
         }
+        Format::Tico => crate::tico::tico_pack_dir(dir),
     }
 }
 
@@ -298,6 +315,7 @@ pub fn list_names(data: &[u8]) -> Result<Vec<String>> {
             .collect()),
         Some(Format::Tar) => Ok(tar_unpack(data)?.iter().map(|e| e.path.clone()).collect()),
         Some(Format::App) => Ok(crate::app::AppReader::from_bytes(data)?.list_names()),
+        Some(Format::Tico) => Ok(crate::tico::TicoReader::from_bytes(data)?.list_names()),
         _ => Err(invalid("unknown archive format")),
     }
 }
@@ -379,6 +397,13 @@ pub fn compress_file(src: &Path, dst: &Path, format: Option<Format>) -> Result<(
                 .ok_or_else(|| invalid("bad destination name"))?;
             crate::app::app_pack_dir(src, app_name, Some(level))?
         }
+        Format::Tico => {
+            let meta = fs::symlink_metadata(src).map_err(ArchiveError::from)?;
+            if !meta.is_dir() {
+                return Err(invalid("tico packs a directory tree, not a single file"));
+            }
+            crate::tico::tico_pack_dir(src)?
+        }
     };
     if let Some(parent) = dst.parent() {
         if !parent.as_os_str().is_empty() {
@@ -431,6 +456,10 @@ pub fn extract_bytes(data: &[u8], src_hint: Option<&Path>, dst_dir: &Path) -> Re
         Some(Format::Tar) => tar_unpack_to_dir(data, dst_dir),
         Some(Format::App) => {
             let mut reader = crate::app::AppReader::from_bytes(data)?;
+            reader.extract_to(dst_dir)
+        }
+        Some(Format::Tico) => {
+            let mut reader = crate::tico::TicoReader::from_bytes(data)?;
             reader.extract_to(dst_dir)
         }
         Some(Format::Gzip) => {
@@ -537,6 +566,30 @@ mod tests {
         assert_eq!(detect_format(&z), Some(Format::Zip));
         let t = tar_pack(&[TarEntry::file("a", b"b".to_vec())]).unwrap();
         assert_eq!(detect_format(&t), Some(Format::Tar));
+        let mut tlyr = Vec::new();
+        tlyr.extend_from_slice(b"TLYR");
+        tlyr.push(1);
+        tlyr.push(1);
+        tlyr.extend_from_slice(&1u32.to_le_bytes());
+        tlyr.extend_from_slice(&1u32.to_le_bytes());
+        tlyr.extend_from_slice(&1u32.to_le_bytes());
+        tlyr.extend_from_slice(&[0]);
+        let mut tb = crate::tico::TicoBuilder::new();
+        tb.set_manifest(crate::tico::TicoManifest {
+            name: "t".to_string(),
+            canvas: 1024,
+            background: crate::tico::TicoBackground::Color {
+                color: "#FFFFFF".to_string(),
+            },
+            layers: vec![crate::tico::TicoLayerMeta {
+                file: "layer/00.tlyr".to_string(),
+                opacity: 1.0,
+                recolorable: true,
+                default_color: "#000000".to_string(),
+            }],
+        });
+        tb.add_layer("layer/00.tlyr", tlyr).unwrap();
+        assert_eq!(detect_format(&tb.finish().unwrap()), Some(Format::Tico));
         assert_eq!(detect_format(b"junk"), None);
     }
 

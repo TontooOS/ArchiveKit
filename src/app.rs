@@ -20,15 +20,20 @@
 //! ```
 //!
 //! The manifest is written and parsed with FishFile. Icons are `.tico`
-//! files as defined by CoreIcon (`CoreIcon/src/tico.rs`): a ZIP holding
-//! `manifest.json` plus `layer/*.tlyr` layers. ArchiveKit validates that
-//! structure natively with its own ZIP reader (magic, version, layer
-//! references); decoding and rendering stay in CoreIcon.
+//! files as defined by [`crate::tico`]: a TICO container (same indexed
+//! engine as TAPP, own `TICO`/`TICF` magic) holding `manifest.fico` plus
+//! `layer/*.tlyr` layers. ArchiveKit validates that structure natively
+//! (magic, version, layer references); decoding and rendering stay in
+//! CoreIcon.
+//!
+//! [`validate_tico`] and [`TicoInfo`] are re-exported here from
+//! [`crate::tico`] so existing `archivekit::app::` import paths keep
+//! working.
 
 use crate::crc::Crc32;
 use crate::deflate::{compress_raw, decompress_raw_limited, CompressionLevel, DEFAULT_MAX_OUTPUT};
 use crate::error::{invalid, ArchiveError, Result};
-use crate::zip::zip_unpack;
+pub use crate::tico::{validate_tico, TicoInfo};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
@@ -204,158 +209,6 @@ impl AppManifest {
             names,
         })
     }
-}
-
-// ---------------------------------------------------------------------------
-// .tico structural validation (mirrors CoreIcon/src/tico.rs rules)
-// ---------------------------------------------------------------------------
-
-/// Validated `.tico` contents: layer files referenced by `manifest.json`.
-#[derive(Debug, Clone)]
-pub struct TicoInfo {
-    /// Layer paths inside the `.tico` (e.g. `layer/00.tlyr`).
-    pub layers: Vec<String>,
-}
-
-/// Validate `.tico` bytes structurally (no rendering).
-///
-/// Rules mirrored from `CoreIcon/src/tico.rs`:
-/// - the file is a ZIP holding `manifest.json` plus `layer/*.tlyr`
-/// - `manifest.json` declares `"format": "tico"`
-/// - every `.tlyr` starts with `TLYR` magic and version byte `1`, and its
-///   declared payload length fits
-/// - every layer file is referenced by `manifest.json`, and every
-///   `"file"` reference exists
-/// - no `.png` files (tico never embeds PNG)
-///
-/// Full decoding/rendering stays in CoreIcon.
-pub fn validate_tico(bytes: &[u8]) -> Result<TicoInfo> {
-    let entries = zip_unpack(bytes).map_err(|e| invalid(format!("tico is not a valid zip: {e}")))?;
-    let mut manifest: Option<&[u8]> = None;
-    let mut layers: Vec<&str> = Vec::new();
-    for e in &entries {
-        if e.is_dir() {
-            continue;
-        }
-        if e.name == "manifest.json" {
-            manifest = Some(&e.data);
-        } else if e.name.ends_with(".tlyr") {
-            layers.push(&e.name);
-        } else if e.name.ends_with(".png") {
-            return Err(invalid("tico must not contain .png files"));
-        }
-    }
-    let manifest = manifest.ok_or_else(|| invalid("tico missing manifest.json"))?;
-    if layers.is_empty() {
-        return Err(invalid("tico has no .tlyr layers"));
-    }
-    let text = std::str::from_utf8(manifest)
-        .map_err(|_| invalid("tico manifest.json is not utf-8"))?;
-    if !has_json_string_value(text, "format", "tico") {
-        return Err(invalid("tico manifest is not format tico"));
-    }
-    let refs = json_string_values(text, "file");
-    for r in &refs {
-        if !entries.iter().any(|e| &e.name == r) {
-            return Err(invalid(format!("tico references missing file '{r}'")));
-        }
-    }
-    for layer in &layers {
-        if !refs.iter().any(|r| r == layer) {
-            return Err(invalid(format!("tico layer '{layer}' is not referenced")));
-        }
-        let data = entries
-            .iter()
-            .find(|e| &e.name == layer)
-            .map(|e| e.data.as_slice())
-            .unwrap_or(&[]);
-        validate_tlyr(data)?;
-    }
-    Ok(TicoInfo {
-        layers: layers.iter().map(|s| s.to_string()).collect(),
-    })
-}
-
-/// Check one `.tlyr` blob: `TLYR` magic, version 1, fitting payload length.
-fn validate_tlyr(bytes: &[u8]) -> Result<()> {
-    if bytes.len() < 18 {
-        return Err(invalid("tlyr too short"));
-    }
-    if &bytes[0..4] != b"TLYR" {
-        return Err(invalid("bad tlyr magic"));
-    }
-    if bytes[4] != 1 {
-        return Err(invalid(format!("unsupported tlyr v{}", bytes[4])));
-    }
-    let len =
-        u32::from_le_bytes([bytes[14], bytes[15], bytes[16], bytes[17]]) as usize;
-    if bytes.len() < 18 + len {
-        return Err(invalid("tlyr truncated"));
-    }
-    Ok(())
-}
-
-/// Extract all string values of `key` from flat JSON (`"key": "value"`).
-fn json_string_values(text: &str, key: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut search = text;
-    let needle = format!("\"{key}\"");
-    while let Some(pos) = search.find(&needle) {
-        let mut rest = &search[pos + needle.len()..];
-        rest = rest.trim_start_matches(|c: char| c == ' ' || c == '\t' || c == '\n' || c == '\r');
-        if !rest.starts_with(':') {
-            search = &search[pos + needle.len()..];
-            continue;
-        }
-        rest = rest[1..].trim_start_matches(|c: char| {
-            c == ' ' || c == '\t' || c == '\n' || c == '\r'
-        });
-        if !rest.starts_with('"') {
-            search = &search[pos + needle.len()..];
-            continue;
-        }
-        let mut value = String::new();
-        let mut chars = rest[1..].chars();
-        let mut closed = false;
-        let mut consumed = 1usize; // opening quote
-        while let Some(c) = chars.next() {
-            consumed += c.len_utf8();
-            if c == '\\' {
-                if let Some(e) = chars.next() {
-                    consumed += e.len_utf8();
-                    match e {
-                        'n' => value.push('\n'),
-                        't' => value.push('\t'),
-                        'r' => value.push('\r'),
-                        '"' => value.push('"'),
-                        '\\' => value.push('\\'),
-                        '/' => value.push('/'),
-                        _ => {
-                            value.push('\\');
-                            value.push(e);
-                        }
-                    }
-                }
-                continue;
-            }
-            if c == '"' {
-                closed = true;
-                break;
-            }
-            value.push(c);
-        }
-        if closed {
-            out.push(value);
-        }
-        search = &rest[consumed.min(rest.len())..];
-    }
-    out
-}
-
-fn has_json_string_value(text: &str, key: &str, expected: &str) -> bool {
-    json_string_values(text, key)
-        .iter()
-        .any(|v| v == expected)
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,8 +973,7 @@ mod tests {
     }
 
     fn minimal_tico() -> Vec<u8> {
-        // manifest.json + one layer, packed with our own zip writer.
-        let manifest = r##"{"format":"tico","version":1,"name":"demo","canvas":1024,"background":{"color":"#FFFFFF"},"layers":[{"file":"layer/00.tlyr","opacity":1.0,"recolorable":true,"default_color":"#000000"}]}"##;
+        // manifest.fico + one layer, packed with the TICO container engine.
         let mut tlyr = Vec::new();
         tlyr.extend_from_slice(b"TLYR");
         tlyr.push(1);
@@ -1130,14 +982,23 @@ mod tests {
         tlyr.extend_from_slice(&64u32.to_le_bytes());
         tlyr.extend_from_slice(&4u32.to_le_bytes());
         tlyr.extend_from_slice(&[1, 2, 3, 4]);
-        crate::zip::ZipWriter::new();
-        let mut w = crate::zip::ZipWriter::with_options(crate::zip::ZipWriterOptions {
-            level: CompressionLevel::None,
-            comment: String::new(),
-        });
-        w.append_file("manifest.json", manifest.as_bytes()).unwrap();
-        w.append_file("layer/00.tlyr", &tlyr).unwrap();
-        w.finish()
+        let manifest = crate::tico::TicoManifest {
+            name: "demo".to_string(),
+            canvas: 1024,
+            background: crate::tico::TicoBackground::Color {
+                color: "#FFFFFF".to_string(),
+            },
+            layers: vec![crate::tico::TicoLayerMeta {
+                file: "layer/00.tlyr".to_string(),
+                opacity: 1.0,
+                recolorable: true,
+                default_color: "#000000".to_string(),
+            }],
+        };
+        let mut b = crate::tico::TicoBuilder::new();
+        b.set_manifest(manifest);
+        b.add_layer("layer/00.tlyr", tlyr).unwrap();
+        b.finish().unwrap()
     }
 
     #[test]
@@ -1169,20 +1030,44 @@ mod tests {
     fn tico_validation() {
         let info = validate_tico(&minimal_tico()).unwrap();
         assert_eq!(info.layers, vec!["layer/00.tlyr".to_string()]);
-        assert!(validate_tico(b"not a zip").is_err());
-        // Bad tlyr magic.
-        let bad = minimal_tico();
-        let entries = crate::zip::zip_unpack(&bad).unwrap();
-        let _ = entries;
+        assert!(validate_tico(b"not a tico").is_err());
+        // ZIP bytes are not valid tico containers anymore.
+        let zip = crate::zip::zip_pack(
+            &[("manifest.fico", b"tico { format: tico }" as &[u8])],
+            &crate::zip::ZipWriterOptions {
+                level: CompressionLevel::None,
+                comment: String::new(),
+            },
+        )
+        .unwrap();
+        assert!(validate_tico(&zip).is_err());
         // Craft invalid: png inside.
-        let mut w = crate::zip::ZipWriter::with_options(crate::zip::ZipWriterOptions {
-            level: CompressionLevel::None,
-            comment: String::new(),
-        });
-        w.append_file("manifest.json", b"{\"format\":\"tico\"}").unwrap();
-        w.append_file("a.png", b"png").unwrap();
-        assert!(validate_tico(&w.finish()).is_err());
-        let _ = bad;
+        let manifest = crate::tico::TicoManifest {
+            name: "bad".to_string(),
+            canvas: 1024,
+            background: crate::tico::TicoBackground::Color {
+                color: "#FFFFFF".to_string(),
+            },
+            layers: vec![crate::tico::TicoLayerMeta {
+                file: "layer/00.tlyr".to_string(),
+                opacity: 1.0,
+                recolorable: true,
+                default_color: "#000000".to_string(),
+            }],
+        };
+        let mut tlyr = Vec::new();
+        tlyr.extend_from_slice(b"TLYR");
+        tlyr.push(1);
+        tlyr.push(1);
+        tlyr.extend_from_slice(&64u32.to_le_bytes());
+        tlyr.extend_from_slice(&64u32.to_le_bytes());
+        tlyr.extend_from_slice(&4u32.to_le_bytes());
+        tlyr.extend_from_slice(&[1, 2, 3, 4]);
+        let mut b = crate::tico::TicoBuilder::new();
+        b.set_manifest(manifest);
+        b.add_layer("layer/00.tlyr", tlyr).unwrap();
+        b.add_file("a.png", b"png".to_vec()).unwrap();
+        assert!(validate_tico(&b.finish().unwrap()).is_err());
     }
 
     #[test]
@@ -1300,12 +1185,4 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn json_scan_handles_escapes() {
-        let text = r#"{"format":"tico","layers":[{"file":"layer/a\"b.tlyr"}]}"#;
-        let vals = json_string_values(text, "file");
-        assert_eq!(vals, vec!["layer/a\"b.tlyr".to_string()]);
-        assert!(has_json_string_value(text, "format", "tico"));
-        assert!(!has_json_string_value(text, "format", "zip"));
-    }
 }
