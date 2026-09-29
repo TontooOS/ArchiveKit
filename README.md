@@ -40,4 +40,4 @@ Layout mirrors TBuild (`App/`, `Resources/`, `Info.tontoo` manifest in fico synt
 
 ## License
 
-TCL v26.1
+TCL v27.0

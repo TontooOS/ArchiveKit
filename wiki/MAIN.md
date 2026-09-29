@@ -3,7 +3,7 @@
 ZIP, GZIP, TAR and `.app` single-file containers for TontooOS. Hand-written DEFLATE, CRC32, TAR and ZIP codecs (dependency-free) plus indexed TAPP app containers with FishFile manifests and `.tico` icons.
 
 - Repository: https://github.com/TontooOS/ArchiveKit
-- License: TCL v26.1
+- License: TCL v27.0
 - Version: 27.0.0
 
 ## Feature Index
