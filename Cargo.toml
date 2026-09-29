@@ -15,7 +15,7 @@ readme = "README.md"
 
 [dependencies]
 # App manifests (.fico) via FishFile; the codecs stay dependency-free.
-fishfile = { version = "26.1", path = "../FishFile" }
+fishfile = { version = "27.0", path = "../FishFile" }
 
 [dev-dependencies]
 # Benchmark-only competitors (never used by the library itself).
