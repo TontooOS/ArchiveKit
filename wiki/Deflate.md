@@ -105,4 +105,5 @@ fn main() -> archivekit::Result<()> {
 
 - [Gzip.md](Gzip.md) – wraps this engine with headers, CRC32 and members
 - [Zip.md](Zip.md) – uses this engine for Deflate entries
+- [Zlib.md](Zlib.md) - wraps this engine with the RFC 1950 header and Adler-32
 - [Error.md](Error.md) – `InvalidData` cases for corrupt streams

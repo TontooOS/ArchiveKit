@@ -13,6 +13,7 @@ ZIP, GZIP, TAR and `.app` single-file containers for TontooOS. Hand-written DEFL
 | Main index | [MAIN.md](MAIN.md) | This page |
 | Rules | [RULE.md](RULE.md) | Wiki design system |
 | Deflate | [Deflate.md](Deflate.md) | Raw DEFLATE engine (RFC 1951) and compression levels |
+| Zlib | [Zlib.md](Zlib.md) | ZLIB streams (RFC 1950), Adler-32, checksum-verified and lenient |
 | Gzip | [Gzip.md](Gzip.md) | GZIP members, multi-member streams, streaming API |
 | Tar | [Tar.md](Tar.md) | TAR reader/writer, PAX, GNU long names, directory I/O |
 | Zip | [Zip.md](Zip.md) | ZIP reader/writer, ZIP64, UTF-8, data descriptors |
@@ -56,6 +57,7 @@ See [Combined.md](Combined.md), [App.md](App.md), [Tico.md](Tico.md), [Zip.md](Z
 
 ## Changelog
 
+- 2026-10-02: New `zlib` module (RFC 1950): `zlib_compress` / `zlib_decompress` plus `zlib_stream` for the header fields, `*_limited` variants for decompression-bomb protection, and `*_unverified` variants that skip the Adler-32 check for sloppy producers such as PDF. `crc::Adler32` and `crc::adler32` added next to CRC32. See [Zlib.md](Zlib.md).
 - 2026-09-29: `.tico` icons moved from ZIP to the indexed TICO container (own `TICO`/`TICF` magic, `manifest.fico` FishFile manifest, `layer/*.tlyr` entries, `TicoBuilder`/`TicoReader`); `validate_tico` enforces the new format; `Format::Tico` added to detection, dir packing, extraction and the C FFI (code 6)
 - 2026-09-27: GZIP single-pass decode, ZIP capacity hints, fuzz harness (120k cases clean) + overflow hardening
 - 2026-09-27: Added `.app` containers (TAPP) with FishFile manifest, tico icons and random access

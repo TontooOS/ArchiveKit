@@ -33,6 +33,7 @@ pub mod gzip;
 pub mod tar;
 pub mod tico;
 pub mod zip;
+pub mod zlib;
 
 /// Library version: (major, minor, patch).
 pub const ARCHIVEKIT_VERSION: (u32, u32, u32) = (26, 1, 0);
@@ -64,6 +65,10 @@ pub use gzip::{
 pub use tar::{tar_pack, tar_pack_dir, tar_unpack, tar_unpack_to_dir, TarEntry, TarKind, TarReader,
     TarWriteOptions, TarWriter};
 pub use zip::{zip_pack, zip_unpack, ZipEntry, ZipFileReader, ZipFileWriter, ZipIndexEntry, ZipMethod, ZipReader, ZipWriter, ZipWriterOptions};
+pub use zlib::{
+    zlib_compress, zlib_decompress, zlib_decompress_limited, zlib_decompress_unverified,
+    zlib_decompress_unverified_limited, zlib_stream, zlib_stream_limited, ZlibStream,
+};
 
 /// Convenience prelude.
 pub mod prelude {

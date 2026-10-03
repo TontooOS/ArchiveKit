@@ -118,6 +118,66 @@ pub fn crc32(data: &[u8]) -> u32 {
     Crc32::checksum(data)
 }
 
+// ------------------------------------------------------------------ Adler-32
+
+/// Streaming Adler-32 hasher (RFC 1950, the zlib stream checksum).
+///
+/// The largest `n` for which `255*n*(n+1)/2 + (n+1)*(BASE-1) <= 2^32-1` is
+/// `5552`, so chunks are reduced at that bound to avoid overflow.
+#[derive(Debug, Clone, Copy)]
+pub struct Adler32 {
+    a: u32,
+    b: u32,
+}
+
+/// Largest chunk that cannot overflow the 32-bit accumulators.
+const ADLER_CHUNK: usize = 5552;
+
+/// Initial value: `s1 = 1`, `s2 = 0`.
+const ADLER_BASE: u32 = 65521;
+
+impl Default for Adler32 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Adler32 {
+    /// Create a new hasher with the standard initial state.
+    pub fn new() -> Self {
+        Self { a: 1, b: 0 }
+    }
+
+    /// Feed bytes into the checksum.
+    pub fn update(&mut self, data: &[u8]) {
+        for chunk in data.chunks(ADLER_CHUNK) {
+            for &byte in chunk {
+                self.a += byte as u32;
+                self.b += self.a;
+            }
+            self.a %= ADLER_BASE;
+            self.b %= ADLER_BASE;
+        }
+    }
+
+    /// Finalize and return the checksum value.
+    pub fn finalize(self) -> u32 {
+        (self.b << 16) | self.a
+    }
+
+    /// One-shot checksum over `data`.
+    pub fn checksum(data: &[u8]) -> u32 {
+        let mut h = Self::new();
+        h.update(data);
+        h.finalize()
+    }
+}
+
+/// One-shot Adler-32 over `data`.
+pub fn adler32(data: &[u8]) -> u32 {
+    Adler32::checksum(data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +196,33 @@ mod tests {
         h.update(b"hello ");
         h.update(b"world");
         assert_eq!(h.finalize(), crc32(b"hello world"));
+    }
+
+    #[test]
+    fn adler32_known_vectors() {
+        // RFC 1950 check value for "123456789".
+        assert_eq!(adler32(b"123456789"), 0x091E01DE);
+        assert_eq!(adler32(b""), 0x0000_0001);
+        assert_eq!(adler32(b"a"), 0x0062_0062);
+    }
+
+    #[test]
+    fn adler32_streaming_matches_oneshot() {
+        let mut h = Adler32::new();
+        h.update(b"hello ");
+        h.update(b"world");
+        assert_eq!(h.finalize(), adler32(b"hello world"));
+    }
+
+    #[test]
+    fn adler32_handles_chunks_beyond_the_overflow_bound() {
+        // 3 full chunks plus a remainder, so the modulo reduction runs more
+        // than once.
+        let data: Vec<u8> = (0..(ADLER_CHUNK * 3 + 17)).map(|i| (i % 251) as u8).collect();
+        let mut h = Adler32::new();
+        for piece in data.chunks(4096) {
+            h.update(piece);
+        }
+        assert_eq!(h.finalize(), adler32(&data));
     }
 }
